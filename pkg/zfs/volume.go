@@ -250,6 +250,29 @@ func DeleteVolume(volumeID string) (err error) {
 	return
 }
 
+// DeleteVolumeAndKey deletes the ZFSVolume CR and then best-effort removes any
+// managed encryption key material held in a KMS (Vault). Use it for a real
+// volume deletion; do NOT use it on a create rollback, where the key must be
+// kept so the retried CreateVolume reuses it instead of minting a new one.
+// The key is removed AFTER the CR delete (a slow/unreachable KMS never gates CR
+// deletion) and only when the CR delete succeeds; zfs destroy does not require
+// the key to be loaded, so the ordering is safe.
+func DeleteVolumeAndKey(volumeID string) error {
+	vol, gerr := GetZFSVolume(volumeID)
+	if err := DeleteVolume(volumeID); err != nil {
+		return err
+	}
+	if gerr == nil {
+		CleanupEncryptionKey(vol)
+	} else {
+		// The CR is gone but we could not read it first, so we do not know the key
+		// source and cannot clean it. Surface it: a KMS/auto-Secret key may be left
+		// behind for this volume.
+		klog.Warningf("zfs: deleted volume %s but could not read its CR to clean up encryption key material: %v", volumeID, gerr)
+	}
+	return nil
+}
+
 // GetVolList fetches the current Published Volume list
 func GetVolList(volumeID string) (*apis.ZFSVolumeList, error) {
 	listOptions := metav1.ListOptions{
