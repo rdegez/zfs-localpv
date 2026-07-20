@@ -293,7 +293,17 @@ func CreateZFSVolume(ctx context.Context, req *csi.CreateVolumeRequest) (*zfsapi
 	}
 
 	// Per-volume key source of a new volume: the Secret named by the PVC
-	// annotation. It requires `encryption`: fail closed.
+	// annotation, else the generated key of the auto mode. Either one requires
+	// `encryption`: fail closed.
+	autoCreate := false
+	if v := parameters["autocreateencryptionkey"]; v != "" {
+		b, perr := strconv.ParseBool(v)
+		if perr != nil {
+			return nil, status.Errorf(codes.InvalidArgument,
+				"invalid value %q for autoCreateEncryptionKey: use \"true\" or \"false\"", v)
+		}
+		autoCreate = b
+	}
 	var pvcSecretName string
 	if pvcName != "" && pvcNamespace != "" {
 		pvc, perr := zfs.GetPVC(pvcNamespace, pvcName)
@@ -311,15 +321,22 @@ func CreateZFSVolume(ctx context.Context, req *csi.CreateVolumeRequest) (*zfsapi
 	}
 
 	// fail closed: never create a plaintext volume when a key source is requested
-	if pvcSecretName != "" && !zfs.EncryptionEnabled(encr) {
+	if (pvcSecretName != "" || autoCreate) && !zfs.EncryptionEnabled(encr) {
 		return nil, status.Errorf(codes.InvalidArgument,
-			"an encryption key source was requested (secret-name annotation) "+
-				"but the StorageClass does not enable the 'encryption' parameter; "+
-				"refusing to create an unencrypted volume")
+			"an encryption key source was requested (secret-name annotation "+
+				"or autoCreateEncryptionKey) but the StorageClass does not enable the "+
+				"'encryption' parameter; refusing to create an unencrypted volume")
+	}
+
+	// several key sources: warn, the precedence applies
+	if pvcSecretName != "" && autoCreate {
+		klog.Warningf("zfs: volume %s has multiple encryption key sources set (annotation and auto); applying precedence Secret > auto",
+			volName)
 	}
 
 	var encKeySecretName, encKeySecretNamespace string
-	if pvcSecretName != "" {
+	switch {
+	case pvcSecretName != "":
 		// fail fast on a missing or malformed key
 		if err := zfs.ValidateEncryptionSecret(pvcSecretName, pvcNamespace); err != nil {
 			return nil, status.Errorf(codes.InvalidArgument,
@@ -328,6 +345,10 @@ func CreateZFSVolume(ctx context.Context, req *csi.CreateVolumeRequest) (*zfsapi
 		}
 		encKeySecretName = pvcSecretName
 		encKeySecretNamespace = pvcNamespace
+	case autoCreate:
+		// the node creates the key right before the dataset
+		encKeySecretName = zfs.AutoKeySecretName(volName)
+		encKeySecretNamespace = zfs.OpenEBSNamespace
 	}
 
 	// managed keys are hex, fed on stdin: no legacy keylocation on the CR
