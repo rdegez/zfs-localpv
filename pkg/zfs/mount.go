@@ -16,6 +16,7 @@ limitations under the License.
 package zfs
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -260,7 +261,13 @@ func MountDataset(vol *apis.ZFSVolume, mount *MountInfo) error {
 }
 
 // MountFilesystem mounts the disk to the specified path
-func MountFilesystem(vol *apis.ZFSVolume, mount *MountInfo) error {
+func MountFilesystem(ctx context.Context, vol *apis.ZFSVolume, mount *MountInfo) error {
+	// make sure the encryption key is loaded before mounting, otherwise the
+	// dataset/zvol device is not accessible (e.g. after a node reboot).
+	if err := EnsureKeyLoaded(ctx, vol); err != nil {
+		return status.Errorf(codes.Internal, "zfs: load-key failed err : %s", err.Error())
+	}
+
 	// creating the directory with 0750 permission so that it can be accessed by other person.
 	// if the directory already exist(old k8s), the creator should set the proper permission.
 	if err := os.MkdirAll(mount.MountPath, 0750); err != nil {
@@ -279,7 +286,12 @@ func MountFilesystem(vol *apis.ZFSVolume, mount *MountInfo) error {
 }
 
 // MountBlock mounts the block disk to the specified path
-func MountBlock(vol *apis.ZFSVolume, mountinfo *MountInfo) error {
+func MountBlock(ctx context.Context, vol *apis.ZFSVolume, mountinfo *MountInfo) error {
+	// make sure the encryption key is loaded before the zvol device is used.
+	if err := EnsureKeyLoaded(ctx, vol); err != nil {
+		return status.Errorf(codes.Internal, "zfs: load-key failed err : %s", err.Error())
+	}
+
 	target := mountinfo.MountPath
 	devicePath := ZFSDevPath + vol.Spec.PoolName + "/" + vol.Name
 	mountopt := []string{"bind"}

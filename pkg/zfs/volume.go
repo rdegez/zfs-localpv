@@ -66,6 +66,10 @@ const (
 	OpenEBSCasTypeKey string = "openebs.io/cas-type"
 	// ZFSCasTypeName for the name of the cas-type
 	ZFSCasTypeName string = "localpv-zfs"
+	// OpenEBSEncryptedKey is set to "true" in the PV volume context when the
+	// volume is encrypted, so encryption is visible on the PV (the key material
+	// is never exposed — this is only a boolean marker).
+	OpenEBSEncryptedKey string = "openebs.io/encrypted"
 )
 
 var (
