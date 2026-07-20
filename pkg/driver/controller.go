@@ -561,6 +561,42 @@ func CreateZFSVolume(ctx context.Context, req *csi.CreateVolumeRequest) (*zfsapi
 		"not able to provision the volume, nodes %v, err : %s", prfList, err.Error())
 }
 
+// cloneKeyConflict returns an error when the annotations of a clone's or a
+// restore's PVC ask for another encryption key than its source's: a clone
+// always uses its source volume's key, so such a request cannot be honoured
+// and must not be silently ignored. An absent annotation, or one naming the
+// source's own Secret, is fine.
+func cloneKeyConflict(src *zfsapi.EncryptionKeyReference, annotations map[string]string, pvcNamespace string) error {
+	name, err := pvcEncryptionSecretName(annotations)
+	if err != nil || name == "" {
+		return err
+	}
+	if src == nil || src.Name != name || src.Namespace != pvcNamespace {
+		return fmt.Errorf("the %q annotation names Secret %s/%s, but a clone or a restore "+
+			"always uses its source's encryption key", zfs.PVCEncryptionSecretAnnotation, pvcNamespace, name)
+	}
+	return nil
+}
+
+// checkCloneKeySource reads the PVC of a clone or a restore and rejects it with
+// InvalidArgument when it asks for another encryption key than its source's.
+// Without the PVC name (no --extra-create-metadata), there is nothing to check.
+func checkCloneKeySource(src *zfsapi.EncryptionKeyReference, pvcNamespace, pvcName string) error {
+	if pvcName == "" || pvcNamespace == "" {
+		return nil
+	}
+	pvc, err := zfs.GetPVC(pvcNamespace, pvcName)
+	if err != nil {
+		return status.Errorf(codes.Internal, "clone: failed to get pvc %s/%s: %s",
+			pvcNamespace, pvcName, err.Error())
+	}
+	if err := cloneKeyConflict(src, pvc.Annotations, pvcNamespace); err != nil {
+		return status.Errorf(codes.InvalidArgument, "clone: pvc %s/%s: %s",
+			pvcNamespace, pvcName, err.Error())
+	}
+	return nil
+}
+
 // CreateVolClone creates the clone from a volume
 func CreateVolClone(ctx context.Context, req *csi.CreateVolumeRequest, srcVol string) (*zfsapi.ZFSVolume, error) {
 	volName := strings.ToLower(req.GetName())
@@ -596,6 +632,10 @@ func CreateVolClone(ctx context.Context, req *csi.CreateVolumeRequest, srcVol st
 
 	if vol.Spec.Capacity != volsize {
 		return nil, status.Error(codes.Internal, "clone: volume size is not matching")
+	}
+
+	if err := checkCloneKeySource(vol.Spec.EncryptionKeyRef, pvcNamespace, pvcName); err != nil {
+		return nil, err
 	}
 
 	labels := map[string]string{zfs.ZFSSrcVolKey: vol.Name}
@@ -674,6 +714,11 @@ func CreateSnapClone(ctx context.Context, req *csi.CreateVolumeRequest, snapshot
 
 	if snap.Spec.Capacity != volsize {
 		return nil, status.Error(codes.Internal, "clone volume size is not matching")
+	}
+
+	// The snapshot carries a copy of its volume's spec, key source included.
+	if err := checkCloneKeySource(snap.Spec.EncryptionKeyRef, pvcNamespace, pvcName); err != nil {
+		return nil, err
 	}
 
 	volObj, err := volbuilder.NewBuilder().
