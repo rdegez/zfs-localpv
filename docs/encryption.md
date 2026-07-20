@@ -26,7 +26,7 @@ encrypted without inspecting the `ZFSVolume` CR:
 
 | Value | Meaning |
 |---|---|
-| `volume` | per-volume key (Secret referenced by the PVC, or generated) |
+| `volume` | per-volume key (Secret referenced by the PVC, or generated); a clone shares its source volume's key |
 | `storageclass` | StorageClass-level key (`keylocation`), shared by every volume of the class |
 | *(absent)* | not encrypted by the driver; the volume may still be encrypted by its pool or parent dataset |
 
@@ -304,6 +304,19 @@ To keep the key material out of etcd, enable
 [etcd encryption at rest with a KMS provider](https://kubernetes.io/docs/tasks/administer-cluster/kms-provider/).
 
 ---
+
+## Snapshots and clones
+
+Snapshots of an encrypted volume are encrypted with it. Clones, from a volume or
+from a snapshot, inherit the parent's encryption root and key source: the node
+loads the parent key before `zfs clone`, so cloning also works right after a node
+reboot, and the clone loads the same key at mount.
+
+The key source travels with the snapshot: its `ZFSSnapshot` CR carries a copy of
+the volume's spec, `encryptionKeyRef` included. A clone or a restore cannot pick
+another key: if its PVC carries an `encryption.openebs.io/secret-name`
+annotation naming another Secret than the source's, provisioning fails with
+`InvalidArgument`.
 
 ## Backup and restore (Velero): not supported
 
