@@ -429,7 +429,7 @@ func buildVolumeBackupArgs(bkp *apis.ZFSBackup, vol *apis.ZFSVolume) (sendArgs [
 // buildVolumeRestoreArgs returns the argv vectors for the `nc` and `zfs recv`
 // processes of the restore pipeline, connected via runPipe. Each
 // `-o property=value` pair is two separate argv elements.
-func buildVolumeRestoreArgs(rstr *apis.ZFSRestore) (ncArgs []string, recvArgs []string, err error) {
+func buildVolumeRestoreArgs(rstr *apis.ZFSRestore, keyLocation string) (ncArgs []string, recvArgs []string, err error) {
 	restoreSrc := rstr.Spec.RestoreSrc
 
 	volume := rstr.VolSpec.PoolName + "/" + rstr.Spec.VolumeName
@@ -471,8 +471,14 @@ func buildVolumeRestoreArgs(rstr *apis.ZFSRestore) (ncArgs []string, recvArgs []
 	if len(rstr.VolSpec.Encryption) != 0 {
 		recvArgs = append(recvArgs, "-o", "encryption="+rstr.VolSpec.Encryption)
 	}
-	if len(rstr.VolSpec.KeyLocation) != 0 {
-		recvArgs = append(recvArgs, "-o", "keylocation="+rstr.VolSpec.KeyLocation)
+	// keyLocation (a temp key file) overrides the legacy VolSpec.KeyLocation when
+	// the key is driver-managed, since recv's stdin is taken by the data stream.
+	kl := rstr.VolSpec.KeyLocation
+	if keyLocation != "" {
+		kl = keyLocation
+	}
+	if len(kl) != 0 {
+		recvArgs = append(recvArgs, "-o", "keylocation="+kl)
 	}
 	if len(rstr.VolSpec.KeyFormat) != 0 {
 		recvArgs = append(recvArgs, "-o", "keyformat="+rstr.VolSpec.KeyFormat)
@@ -571,6 +577,11 @@ func CreateClone(vol *apis.ZFSVolume) error {
 	}
 
 	if err := getVolume(volume); err != nil {
+		// Cloning an encrypted dataset requires the parent's key to be loaded
+		// (e.g. after a node reboot). The clone inherits the parent key source.
+		if err := EnsureParentKeyLoaded(vol); err != nil {
+			return err
+		}
 		args := buildCloneCreateArgs(vol)
 		cmd := exec.Command(ZFSVolCmd, args...)
 		out, err := runCmd(cmd, volume)
@@ -1007,7 +1018,27 @@ func CreateRestore(rstr *apis.ZFSRestore) error {
 	}
 	volume := rstr.VolSpec.PoolName + "/" + rstr.Spec.VolumeName
 
-	ncArgs, recvArgs, err := buildVolumeRestoreArgs(rstr)
+	// For a driver-managed encryption key we cannot feed the key on stdin
+	// (recv's stdin carries the data stream), so write it to a transient 0600
+	// file and point keylocation at it, then reset keylocation to prompt after
+	// the receive so subsequent mounts fetch the key from its source.
+	keyLocation := ""
+	restoreVol := &apis.ZFSVolume{Spec: rstr.VolSpec}
+	restoreVol.Name = rstr.Spec.VolumeName
+	if UsesManagedKey(restoreVol) && len(rstr.VolSpec.Encryption) != 0 {
+		key, kerr := FetchEncryptionKey(restoreVol)
+		if kerr != nil {
+			return kerr
+		}
+		keyFile, kerr := writeTempKeyFile(key)
+		if kerr != nil {
+			return kerr
+		}
+		defer os.Remove(keyFile)
+		keyLocation = "file://" + keyFile
+	}
+
+	ncArgs, recvArgs, err := buildVolumeRestoreArgs(rstr, keyLocation)
 	if err != nil {
 		return err
 	}
@@ -1021,6 +1052,17 @@ func CreateRestore(rstr *apis.ZFSRestore) error {
 		zerr := NewZFSError("zfs recv (restore)", volume, err, out)
 		klog.Errorf("zfs: could not restore the volume %v cmd %v | %v error: %s", volume, ncCmd.Args, recvCmd.Args, zerr)
 		return zerr
+	}
+
+	// Switch the restored dataset back to keylocation=prompt so future mounts
+	// load the key via stdin. This must succeed: the temp key file is removed on
+	// return (deferred), so leaving keylocation pointing at it would make the
+	// volume unmountable. Fail the restore so it is retried.
+	if keyLocation != "" {
+		if serr := SetKeyLocationPrompt(volume); serr != nil {
+			klog.Errorf("zfs: restored %v but could not reset keylocation to prompt: %s", volume, serr.Error())
+			return serr
+		}
 	}
 
 	/*

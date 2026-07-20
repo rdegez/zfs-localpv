@@ -102,3 +102,38 @@ func TestBuildCreateArgs_ManagedKey(t *testing.T) {
 		}
 	})
 }
+
+func TestBuildVolumeRestoreArgs_Encryption(t *testing.T) {
+	rstr := &apis.ZFSRestore{}
+	rstr.Spec.RestoreSrc = "10.0.0.1:9000"
+	rstr.Spec.VolumeName = "pvc-restore"
+	rstr.VolSpec.PoolName = "pool"
+	rstr.VolSpec.Encryption = "aes-256-gcm"
+	rstr.VolSpec.KeyFormat = "hex"
+
+	t.Run("managed key uses provided temp keylocation", func(t *testing.T) {
+		rstr.VolSpec.EncryptionKeyRef = &apis.EncryptionKeyReference{Name: "my-key"}
+		_, recvArgs, err := buildVolumeRestoreArgs(rstr, "file:///tmp/zfs-enc-key-123")
+		if err != nil {
+			t.Fatalf("buildVolumeRestoreArgs: %v", err)
+		}
+		if !hasArg(recvArgs, "keylocation=file:///tmp/zfs-enc-key-123") {
+			t.Errorf("expected temp keylocation, got %v", recvArgs)
+		}
+		if !hasArg(recvArgs, "encryption=aes-256-gcm") || !hasArg(recvArgs, "keyformat=hex") {
+			t.Errorf("expected encryption/keyformat, got %v", recvArgs)
+		}
+	})
+
+	t.Run("no override falls back to VolSpec.KeyLocation", func(t *testing.T) {
+		rstr.VolSpec.EncryptionKeyRef = nil
+		rstr.VolSpec.KeyLocation = "file:///etc/zfs/key"
+		_, recvArgs, err := buildVolumeRestoreArgs(rstr, "")
+		if err != nil {
+			t.Fatalf("buildVolumeRestoreArgs: %v", err)
+		}
+		if !hasArg(recvArgs, "keylocation=file:///etc/zfs/key") {
+			t.Errorf("expected legacy keylocation, got %v", recvArgs)
+		}
+	})
+}
