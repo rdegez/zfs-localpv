@@ -102,3 +102,22 @@ func TestBuildCreateArgs_ManagedKey(t *testing.T) {
 		}
 	})
 }
+
+func TestEncryptedMarker(t *testing.T) {
+	ref := &apis.EncryptionKeyReference{Name: "db-key", Namespace: "apps"}
+	tests := []struct {
+		name string
+		spec apis.VolumeInfo
+		want string
+	}{
+		{"not encrypted", apis.VolumeInfo{}, ""},
+		{"per-volume key", apis.VolumeInfo{Encryption: "aes-256-gcm", EncryptionKeyRef: ref}, EncryptedVolume},
+		{"storageclass keylocation", apis.VolumeInfo{Encryption: "aes-256-gcm", KeyLocation: "file:///keys/k"}, EncryptedStorageClass},
+	}
+	for _, tt := range tests {
+		vol := &apis.ZFSVolume{Spec: tt.spec}
+		if got := EncryptedMarker(vol); got != tt.want {
+			t.Errorf("%s: EncryptedMarker = %q, want %q", tt.name, got, tt.want)
+		}
+	}
+}
