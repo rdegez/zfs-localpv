@@ -31,6 +31,15 @@ fast on an empty annotation or a missing or invalid key, and never creates an
 unencrypted volume when a key source was requested. Volumes encrypted by the
 driver carry `openebs.io/encrypted` on their PV: `volume` for a per-volume key,
 `storageclass` for the StorageClass `keylocation`.
+ - Auto-generated per-volume encryption keys
+With `autoCreateEncryptionKey: "true"` on the StorageClass, every volume gets
+its own generated key, with nothing to set per PVC, which suits StatefulSets and
+operators creating PVCs through `volumeClaimTemplates`. The node agent stores
+the key in an immutable Secret `zfs-enc-<volume>` in the driver namespace right
+before creating the dataset, and deletes it once the dataset is destroyed. A
+ValidatingAdmissionPolicy shipped with the chart (Kubernetes 1.30+,
+`encryptionKeyProtection.enabled`) protects these Secrets from deletion, and is
+kept on `helm uninstall`.
 
 Behaviour Changes
 

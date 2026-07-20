@@ -32,15 +32,22 @@ import (
 var _ = Describe("[zfspv] TEST PER-VOLUME ENCRYPTION", func() {
 	Context("App is deployed with zfs driver", func() {
 		It("Running per-volume encryption test with a key Secret", encryptionSecretModeTest)
+		It("Running per-volume encryption test with generated keys", encryptionAutoModeTest)
 	})
 })
 
 const (
-	encSCName      = "zfspv-sc-enc"
-	encPlainSCName = "zfspv-sc-enc-plain"
-	encKeySecret   = "zfspv-enc-key"
-	encPvcName     = "zfspv-pvc-enc"
-	encAppName     = "busybox-zfspv-enc"
+	encSCName       = "zfspv-sc-enc"
+	encAutoSCName   = "zfspv-sc-enc-auto"
+	encPlainSCName  = "zfspv-sc-enc-plain"
+	encKeySecret    = "zfspv-enc-key"
+	encPvcName      = "zfspv-pvc-enc"
+	encAppName      = "busybox-zfspv-enc"
+	encAutoPvcName1 = "zfspv-pvc-enc-auto-1"
+	encAutoPvcName2 = "zfspv-pvc-enc-auto-2"
+	encAutoAppName  = "busybox-zfspv-enc-auto"
+
+	encVAPName = "openebs-zfs-protect-encryption-keys"
 )
 
 // encStorageClass returns a StorageClass manifest on the test pool, with the
@@ -146,8 +153,23 @@ func encMarker(pvcName string) string {
 	return string(stdout)
 }
 
+// secretData returns a data entry of a Secret in the driver namespace, decoded.
+func secretData(name, entry string) string {
+	stdout, stderr, err := kubectl("get", "secret", name, "-n", OpenEBSNamespace,
+		"-o", "go-template={{index .data \""+entry+"\" | base64decode}}")
+	Expect(err).ShouldNot(HaveOccurred(), "stdout=%s, stderr=%s", stdout, stderr)
+	return string(stdout)
+}
+
 func secretExists(name string) bool {
 	_, _, err := kubectl("get", "secret", name, "-n", OpenEBSNamespace)
+	return err == nil
+}
+
+// keyProtectionInstalled reports whether the chart rendered the admission
+// policy protecting the generated keys (Kubernetes >= 1.30).
+func keyProtectionInstalled() bool {
+	_, _, err := kubectl("get", "validatingadmissionpolicy", encVAPName)
 	return err == nil
 }
 
@@ -182,4 +204,56 @@ func encryptionSecretModeTest() {
 	deleteKeySecret(encKeySecret)
 	deleteStorageClassByName(encPlainSCName)
 	deleteStorageClassByName(encSCName)
+}
+
+func encryptionAutoModeTest() {
+	kubectlApply(encStorageClass(encAutoSCName, map[string]string{
+		"encryption":              "aes-256-gcm",
+		"autoCreateEncryptionKey": "true",
+	}))
+	createBoundEncPVC(encAutoPvcName1, encAutoSCName, nil, "")
+	createBoundEncPVC(encAutoPvcName2, encAutoSCName, nil, "")
+
+	keys := map[string]string{}
+	By("verifying each volume has its own generated key", func() {
+		for _, pvcName := range []string{encAutoPvcName1, encAutoPvcName2} {
+			vol := getZVName(pvcName)
+			name, ns := encKeyRef(pvcName)
+			Expect(name).To(Equal(zfs.AutoKeySecretName(vol)))
+			Expect(ns).To(Equal(OpenEBSNamespace))
+			Expect(encMarker(pvcName)).To(Equal(zfs.EncryptedVolume))
+
+			labels, stderr, err := kubectl("get", "secret", name, "-n", OpenEBSNamespace,
+				"-o", "jsonpath={.metadata.labels}")
+			Expect(err).ShouldNot(HaveOccurred(), "stderr=%s", stderr)
+			Expect(string(labels)).To(ContainSubstring(`"` + zfs.AutoKeySecretLabel + `":"true"`))
+			Expect(string(labels)).To(ContainSubstring(`"` + zfs.AutoKeyVolumeLabel + `":"` + vol + `"`))
+			Expect(secretData(name, "volume")).To(Equal(vol))
+			keys[pvcName] = secretData(name, "key")
+			Expect(keys[pvcName]).To(HaveLen(64))
+		}
+		Expect(keys[encAutoPvcName1]).NotTo(Equal(keys[encAutoPvcName2]), "generated keys must differ")
+	})
+	By("Creating and deploying app pod", func() { createDeployVerifyApp(encAutoAppName, encAutoPvcName2) })
+
+	if keyProtectionInstalled() {
+		By("verifying the admission policy denies deleting a generated key", func() {
+			stdout, stderr, err := kubectl("delete", "secret", zfs.AutoKeySecretName(getZVName(encAutoPvcName1)),
+				"-n", OpenEBSNamespace)
+			Expect(err).Should(HaveOccurred(), "stdout=%s", stdout)
+			Expect(string(stderr)).To(ContainSubstring("denied"))
+		})
+	}
+
+	By("verifying the generated key is deleted with its volume", func() {
+		secret := zfs.AutoKeySecretName(getZVName(encAutoPvcName1))
+		deletePVC(encAutoPvcName1)
+		Eventually(func() bool { return secretExists(secret) }, 120, 5).Should(BeFalse(),
+			"while waiting for the generated key %s to be deleted", secret)
+	})
+
+	By("Deleting application deployment")
+	deleteAppDeployment(encAutoAppName)
+	deletePVC(encAutoPvcName2)
+	deleteStorageClassByName(encAutoSCName)
 }
