@@ -268,10 +268,19 @@ func CreateZFSVolume(ctx context.Context, req *csi.CreateVolumeRequest) (*zfsapi
 	shared := parameters["shared"]
 	quotatype := parameters["quotatype"]
 
-	// Per-volume key source: the Secret named by the PVC annotation. It requires
-	// `encryption`: fail closed.
+	// Per-volume key source: the Secret named by the PVC annotation, else the
+	// generated key of the auto mode. Either one requires `encryption`: fail closed.
 	var encKeySecretName, encKeySecretNamespace string
 	{
+		autoCreate := false
+		if v := parameters["autocreateencryptionkey"]; v != "" {
+			b, perr := strconv.ParseBool(v)
+			if perr != nil {
+				return nil, status.Errorf(codes.InvalidArgument,
+					"invalid value %q for autoCreateEncryptionKey: use \"true\" or \"false\"", v)
+			}
+			autoCreate = b
+		}
 		encryptionRequested := len(encr) != 0
 
 		pvcName := parameters["csi.storage.k8s.io/pvc/name"]
@@ -293,15 +302,22 @@ func CreateZFSVolume(ctx context.Context, req *csi.CreateVolumeRequest) (*zfsapi
 		}
 
 		// fail closed: never create a plaintext volume when a key source is requested
-		if !encryptionRequested && pvcSecretName != "" {
+		if !encryptionRequested && (pvcSecretName != "" || autoCreate) {
 			return nil, status.Errorf(codes.InvalidArgument,
-				"an encryption key source was requested (secret-name annotation) "+
-					"but the StorageClass does not set the 'encryption' parameter; "+
-					"refusing to create an unencrypted volume")
+				"an encryption key source was requested (secret-name annotation "+
+					"or autoCreateEncryptionKey) but the StorageClass does not set the "+
+					"'encryption' parameter; refusing to create an unencrypted volume")
+		}
+
+		// several key sources: warn, the precedence applies
+		if pvcSecretName != "" && autoCreate {
+			klog.Warningf("zfs: volume %s has multiple encryption key sources set (annotation and auto); applying precedence Secret > auto",
+				volName)
 		}
 
 		if encryptionRequested {
-			if pvcSecretName != "" {
+			switch {
+			case pvcSecretName != "":
 				// fail fast on a missing or malformed key
 				if err := zfs.ValidateEncryptionSecret(pvcSecretName, pvcNamespace); err != nil {
 					return nil, status.Errorf(codes.InvalidArgument,
@@ -311,13 +327,19 @@ func CreateZFSVolume(ctx context.Context, req *csi.CreateVolumeRequest) (*zfsapi
 				encKeySecretName = pvcSecretName
 				encKeySecretNamespace = pvcNamespace
 				kf = "hex" // managed keys are supplied to ZFS as raw hex (32 bytes)
+			case autoCreate:
+				// the node creates the key right before the dataset
+				encKeySecretName = zfs.AutoKeySecretName(volName)
+				encKeySecretNamespace = zfs.OpenEBSNamespace
+				kf = "hex"
 			}
 
 			// encryption without any key source: fail here, not in zfs create
 			if encKeySecretName == "" && kl == "" {
 				return nil, status.Errorf(codes.InvalidArgument,
 					"encryption is requested but no key source resolved: set the %q PVC "+
-						"annotation, or a legacy keylocation+keyformat on the StorageClass",
+						"annotation, autoCreateEncryptionKey=\"true\", or a legacy "+
+						"keylocation+keyformat on the StorageClass",
 					zfs.PVCEncryptionSecretAnnotation)
 			}
 		}
