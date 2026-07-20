@@ -84,6 +84,9 @@ func (c *ZVController) syncZV(zv *apis.ZFSVolume) error {
 			err = zfs.DestroyVolume(zv)
 			if err == nil {
 				zfs.EmitSuccessEvent(c.recorder, zv, zfs.ReasonDestroyed, "volume destroyed")
+				// The driver-managed auto-key Secret (if any) is garbage-collected
+				// by Kubernetes via its OwnerReference to this CR once the CR is
+				// gone — no explicit cleanup needed here.
 				err = zfs.RemoveVolumeFinalizer(zv)
 			} else {
 				zfs.EmitFailureEvent(c.recorder, zv, zfs.ReasonDestroyFailed, err)

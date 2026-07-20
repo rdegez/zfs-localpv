@@ -18,6 +18,7 @@ package zfs
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/hex"
 	"fmt"
 	"strings"
@@ -33,6 +34,16 @@ const (
 	// hexKeyLen is the length of a 32-byte key encoded as hex (keyformat=hex).
 	hexKeyLen = 64
 )
+
+// generateHexKey returns a fresh 32-byte key encoded as 64 hex characters,
+// suitable for ZFS keyformat=hex (used by auto mode to mint a per-volume key).
+func generateHexKey() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("generate encryption key: %w", err)
+	}
+	return hex.EncodeToString(b), nil
+}
 
 // validateHexKey checks that key is a 64-character hex string (32 bytes),
 // suitable for ZFS keyformat=hex.
