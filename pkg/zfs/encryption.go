@@ -397,3 +397,18 @@ func waitForDevice(ctx context.Context, device string, timeout time.Duration) er
 		}
 	}
 }
+
+// EnsureParentKeyLoaded loads the key for the dataset a clone is derived from,
+// so `zfs clone` (which requires the parent key to be available) succeeds even
+// after a node reboot. vol is the clone's ZFSVolume (its Spec carries the same
+// key source as the parent, since clones inherit it).
+func EnsureParentKeyLoaded(vol *apis.ZFSVolume) error {
+	if !UsesManagedKey(vol) || vol.Spec.SnapName == "" {
+		return nil
+	}
+	src := strings.SplitN(vol.Spec.SnapName, "@", 2)[0]
+	if src == "" {
+		return nil
+	}
+	return loadKeyForDataset(vol, vol.Spec.PoolName+"/"+src)
+}

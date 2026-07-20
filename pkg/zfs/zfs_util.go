@@ -591,6 +591,11 @@ func CreateClone(vol *apis.ZFSVolume) error {
 	}
 
 	if err := getVolume(volume); err != nil {
+		// Cloning an encrypted dataset requires the parent's key to be loaded
+		// (e.g. after a node reboot). The clone inherits the parent key source.
+		if err := EnsureParentKeyLoaded(vol); err != nil {
+			return err
+		}
 		args := buildCloneCreateArgs(vol)
 		cmd := exec.Command(ZFSVolCmd, args...)
 		out, err := runCmd(cmd, volume)
