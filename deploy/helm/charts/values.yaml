@@ -221,6 +221,13 @@ analytics:
 backupGC:
   enabled: false
 
+# Protect the driver-managed encryption key Secrets (autoCreateEncryptionKey)
+# from deletion with a ValidatingAdmissionPolicy (Kubernetes >= 1.30): only the
+# node agent may delete one, once its volume's dataset is destroyed. Annotate a
+# Secret with local.zfs.openebs.io/allow-key-deletion: "true" to lift it.
+encryptionKeyProtection:
+  enabled: true
+
 zfs:
   # If you use a non-standard path to the zfs binary, specify it here
   # bin: /run/current-system/sw/bin/zfs
