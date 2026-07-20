@@ -565,11 +565,17 @@ func CreateVolume(vol *apis.ZFSVolume) error {
 				klog.Errorf("zfs: could not create volume %v error: %s", volume, kerr)
 				return kerr
 			}
+			// auto mode: the node creates the key right before the dataset
+			if kerr := EnsureAutoKeySecret(vol); kerr != nil {
+				klog.Errorf("zfs: could not create the encryption key secret for %v error: %s", volume, kerr)
+				return kerr
+			}
 			ctx, cancel := apiContext()
 			key, kerr := FetchEncryptionKey(ctx, vol)
 			cancel()
 			if kerr != nil {
 				klog.Errorf("zfs: could not resolve encryption key for %v error: %s", volume, kerr)
+				discardAutoKeySecret(vol, volume)
 				return kerr
 			}
 			cmd.Stdin = strings.NewReader(key + "\n")
@@ -580,6 +586,7 @@ func CreateVolume(vol *apis.ZFSVolume) error {
 		if err != nil {
 			zerr := NewZFSError("zfs create", volume, err, out)
 			klog.Errorf("zfs: could not create volume %v cmd %v error: %s", volume, args, zerr)
+			discardAutoKeySecret(vol, volume)
 			return zerr
 		}
 		klog.Infof("created volume %s", volume)
@@ -588,6 +595,28 @@ func CreateVolume(vol *apis.ZFSVolume) error {
 	}
 
 	return nil
+}
+
+// discardAutoKeySecret deletes the generated key of a volume whose dataset could
+// not be created: its ZFSVolume has no finalizer, so the destroy path never runs.
+// The key is kept unless its pool can be listed and the dataset is not in it.
+func discardAutoKeySecret(vol *apis.ZFSVolume, volume string) {
+	if !ownsAutoKeySecret(vol) {
+		return
+	}
+	// the pool, not the parent: the parent may be the reason of the failure
+	pool := strings.SplitN(vol.Spec.PoolName, "/", 2)[0]
+	missing, err := datasetMissing(pool, volume)
+	if err != nil {
+		klog.Warningf("zfs: keeping the encryption key secret of %v after a failed creation, cannot confirm that its dataset does not exist: %s", volume, err)
+		return
+	}
+	if !missing {
+		return
+	}
+	if err := deleteAutoKeySecret(vol); err != nil {
+		klog.Errorf("zfs: could not delete the encryption key secret of %v after a failed creation, error: %s", volume, err)
+	}
 }
 
 // CreateClone creates clone for the zvol/dataset as per

@@ -294,17 +294,19 @@ type volumeKey struct {
 }
 
 // volumeKeySource returns the key source of the new volume volName, from the
-// encryption parameter of its StorageClass and the annotation of its PVC
-// pvcNamespace/pvcName. A key Secret named by the PVC enables encryption, with
-// the default cipher, when the StorageClass leaves it unset; it is refused when
-// the StorageClass sets `encryption: off`.
-func volumeKeySource(ctx context.Context, volName, encryption, pvcNamespace, pvcName string) (volumeKey, error) {
+// encryption and autoCreateEncryptionKey parameters of its StorageClass and the
+// annotation of its PVC pvcNamespace/pvcName: the Secret named by the PVC, else
+// a generated key with autoCreate. A key source enables encryption, with the
+// default cipher, when the StorageClass leaves it unset; it is refused when the
+// StorageClass sets `encryption: off`.
+func volumeKeySource(ctx context.Context, volName, encryption string, autoCreate bool,
+	pvcNamespace, pvcName string) (volumeKey, error) {
 	key := volumeKey{encryption: encryption}
 	if err := zfs.ValidateEncryption(encryption); err != nil {
 		return key, status.Error(codes.InvalidArgument, err.Error())
 	}
 	if pvcName == "" || pvcNamespace == "" {
-		if zfs.EncryptionEnabled(encryption) {
+		if zfs.EncryptionEnabled(encryption) || autoCreate {
 			// the PVC may name its own key: never guess
 			return key, status.Errorf(codes.FailedPrecondition,
 				"volume %s is encrypted but its PVC is unknown, so its %q annotation cannot be read: "+
@@ -325,18 +327,27 @@ func volumeKeySource(ctx context.Context, volName, encryption, pvcNamespace, pvc
 		return key, status.Errorf(codes.InvalidArgument, "pvc %s/%s: %s",
 			pvcNamespace, pvcName, err.Error())
 	}
-	if name == "" {
+	if name == "" && !autoCreate {
 		return key, nil
 	}
 	switch encryption {
 	case "off":
 		// fail closed: never create a plaintext volume when a key is requested
 		return key, status.Errorf(codes.InvalidArgument,
-			"pvc %s/%s names the encryption key Secret %s but the StorageClass sets "+
-				"'encryption: off'; refusing to create an unencrypted volume",
-			pvcNamespace, pvcName, name)
+			"an encryption key source was requested (secret-name annotation or "+
+				"autoCreateEncryptionKey) but the StorageClass sets 'encryption: off'; "+
+				"refusing to create an unencrypted volume")
 	case "":
 		key.encryption = "on"
+	}
+	if name != "" && autoCreate {
+		klog.Warningf("zfs: volume %s has multiple encryption key sources set (annotation and auto); "+
+			"applying precedence Secret > auto", volName)
+	}
+	if name == "" {
+		// the node creates the key right before the dataset
+		key.secretName, key.secretNamespace = zfs.AutoKeySecretName(volName), zfs.OpenEBSNamespace
+		return key, nil
 	}
 	// fail fast on a missing or malformed key
 	if err := validateEncryptionSecret(ctx, name, pvcNamespace); err != nil {
@@ -405,7 +416,16 @@ func CreateZFSVolume(ctx context.Context, req *csi.CreateVolumeRequest) (*zfsapi
 		}
 	}
 
-	key, err := volumeKeySource(ctx, volName, encr, pvcNamespace, pvcName)
+	autoCreate := false
+	if v := parameters["autocreateencryptionkey"]; v != "" {
+		b, perr := strconv.ParseBool(v)
+		if perr != nil {
+			return nil, status.Errorf(codes.InvalidArgument,
+				"invalid value %q for autoCreateEncryptionKey: use \"true\" or \"false\"", v)
+		}
+		autoCreate = b
+	}
+	key, err := volumeKeySource(ctx, volName, encr, autoCreate, pvcNamespace, pvcName)
 	if err != nil {
 		return nil, err
 	}

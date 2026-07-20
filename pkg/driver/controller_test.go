@@ -223,19 +223,25 @@ func TestVolumeKeySource(t *testing.T) {
 		return nil
 	}
 
+	auto := volumeKey{"zfs-enc-pvc-" + uid, zfs.OpenEBSNamespace, "on"}
 	tests := map[string]struct {
 		encryption, pvc string
+		autoCreate      bool
 		want            volumeKey
 		code            codes.Code
 	}{
-		"key, encryption unset: enabled":  {"", "keyed", volumeKey{"k1", "apps", "on"}, codes.OK},
-		"key, cipher kept":                {"aes-128-gcm", "keyed", volumeKey{"k1", "apps", "aes-128-gcm"}, codes.OK},
-		"key, encryption off: refused":    {"off", "keyed", volumeKey{}, codes.InvalidArgument},
-		"no key":                          {"", "plain", volumeKey{encryption: ""}, codes.OK},
-		"no key, encrypted":               {"on", "plain", volumeKey{encryption: "on"}, codes.OK},
-		"typo":                            {"offf", "plain", volumeKey{}, codes.InvalidArgument},
-		"unknown PVC, encrypted: refused": {"aes-256-gcm", "", volumeKey{}, codes.FailedPrecondition},
-		"unknown PVC, not encrypted":      {"off", "", volumeKey{encryption: "off"}, codes.OK},
+		"key, encryption unset: enabled":  {"", "keyed", false, volumeKey{"k1", "apps", "on"}, codes.OK},
+		"key, cipher kept":                {"aes-128-gcm", "keyed", false, volumeKey{"k1", "apps", "aes-128-gcm"}, codes.OK},
+		"key, encryption off: refused":    {"off", "keyed", false, volumeKey{}, codes.InvalidArgument},
+		"no key":                          {"", "plain", false, volumeKey{encryption: ""}, codes.OK},
+		"no key, encrypted":               {"on", "plain", false, volumeKey{encryption: "on"}, codes.OK},
+		"typo":                            {"offf", "plain", false, volumeKey{}, codes.InvalidArgument},
+		"unknown PVC, encrypted: refused": {"aes-256-gcm", "", false, volumeKey{}, codes.FailedPrecondition},
+		"unknown PVC, not encrypted":      {"off", "", false, volumeKey{encryption: "off"}, codes.OK},
+		"auto, encryption unset: enabled": {"", "plain", true, auto, codes.OK},
+		"auto, encryption off: refused":   {"off", "plain", true, volumeKey{}, codes.InvalidArgument},
+		"auto and key: the key wins":      {"on", "keyed", true, volumeKey{"k1", "apps", "on"}, codes.OK},
+		"auto, unknown PVC: refused":      {"", "", true, volumeKey{}, codes.FailedPrecondition},
 	}
 	for name, test := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -243,7 +249,7 @@ func TestVolumeKeySource(t *testing.T) {
 			if test.pvc == "" {
 				ns = ""
 			}
-			key, err := volumeKeySource(context.Background(), "pvc-"+uid, test.encryption, ns, test.pvc)
+			key, err := volumeKeySource(context.Background(), "pvc-"+uid, test.encryption, test.autoCreate, ns, test.pvc)
 			assert.Equal(t, test.code, status.Code(err), "%v", err)
 			if err == nil {
 				assert.Equal(t, test.want, key)

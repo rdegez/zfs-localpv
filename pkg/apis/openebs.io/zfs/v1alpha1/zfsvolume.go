@@ -58,7 +58,8 @@ type EncryptionKeyReference struct {
 	// +kubebuilder:validation:MinLength=1
 	Name string `json:"name"`
 
-	// Namespace is the namespace of the Secret, the one of the PVC.
+	// Namespace is the namespace of the Secret: the PVC's namespace for a Secret
+	// referenced by the PVC, the driver namespace for a generated key.
 	// +kubebuilder:validation:MinLength=1
 	Namespace string `json:"namespace"`
 }
