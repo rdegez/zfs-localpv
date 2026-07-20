@@ -27,6 +27,7 @@ import (
 
 	k8sapi "github.com/openebs/lib-csi/pkg/client/k8s"
 	apis "github.com/openebs/zfs-localpv/v2/pkg/apis/openebs.io/zfs/v1"
+	"github.com/openebs/zfs-localpv/v2/pkg/kms"
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -109,7 +110,7 @@ func provisionAutoKeySecret(client kubernetes.Interface, namespace, volName stri
 		return "", "", fmt.Errorf("zfs: get auto key secret %s/%s: %w", namespace, name, err)
 	}
 
-	key, err := generateHexKey()
+	key, err := kms.GenerateHexKey()
 	if err != nil {
 		return "", "", err
 	}
@@ -130,7 +131,7 @@ func provisionAutoKeySecret(client kubernetes.Interface, namespace, volName stri
 		},
 		Immutable: &immutable,
 		Type:      corev1.SecretTypeOpaque,
-		Data:      map[string][]byte{encryptionSecretKeyField: []byte(key)},
+		Data:      map[string][]byte{kms.SecretKeyField: []byte(key)},
 	}
 	if _, err := client.CoreV1().Secrets(namespace).Create(
 		context.Background(), secret, metav1.CreateOptions{}); err != nil {
@@ -228,22 +229,53 @@ func UsesManagedKey(vol *apis.ZFSVolume) bool {
 	return vol.Spec.EncryptionKeyRef != nil
 }
 
+// keyStore builds the KeyStore for a user provided key Secret.
+func keyStore(secretName, secretNamespace string) (kms.KeyStore, error) {
+	client, err := getKubeClient()
+	if err != nil {
+		return nil, err
+	}
+	return kms.GetKMS(kms.ProviderK8sSecret, kms.ProviderInitArgs{
+		Config: map[string]interface{}{
+			kms.ConfigSecretName:      secretName,
+			kms.ConfigSecretNamespace: secretNamespace,
+		},
+		Namespace:  secretNamespace,
+		KubeClient: client,
+	})
+}
+
+// resolveKeyStore builds the KeyStore for the volume from its spec.
+func resolveKeyStore(vol *apis.ZFSVolume) (kms.KeyStore, error) {
+	ref := vol.Spec.EncryptionKeyRef
+	if ref == nil {
+		return nil, fmt.Errorf("zfs: no encryption key secret referenced")
+	}
+	return keyStore(ref.Name, ref.Namespace)
+}
+
 // ValidateEncryptionSecret checks, at provisioning time, that the referenced
 // Secret exists and holds a valid hex key, so a misconfigured annotation fails
 // fast on the controller with a clear message instead of later on the node.
 func ValidateEncryptionSecret(name, namespace string) error {
-	_, err := fetchKeyFromSecret(namespace, name)
+	ks, err := keyStore(name, namespace)
+	if err != nil {
+		return err
+	}
+	defer ks.Destroy()
+	_, err = ks.FetchKey(context.Background(), "")
 	return err
 }
 
 // FetchEncryptionKey returns the hex encoded encryption key for the volume,
 // read from the referenced Kubernetes Secret.
 func FetchEncryptionKey(vol *apis.ZFSVolume) (string, error) {
-	ref := vol.Spec.EncryptionKeyRef
-	if ref == nil {
-		return "", fmt.Errorf("zfs: no encryption key secret referenced")
+	ks, err := resolveKeyStore(vol)
+	if err != nil {
+		return "", err
 	}
-	return fetchKeyFromSecret(ref.Namespace, ref.Name)
+	defer ks.Destroy()
+	return ks.FetchKey(context.Background(), vol.Name)
 }
 
 // getDatasetProperty returns a single ZFS property value for an arbitrary
