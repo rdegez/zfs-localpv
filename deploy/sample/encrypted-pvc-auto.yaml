@@ -1,0 +1,59 @@
+# Example: per-PV ZFS encryption with a key auto-generated and managed by the
+# driver (no per-PVC configuration).
+#
+# How it works:
+#   * The StorageClass sets encryption + autoCreateEncryptionKey: "true".
+#   * At CreateVolume the driver generates a 32-byte hex key and stores it in a
+#     Secret it manages (zfs-enc-<volume-id>, in the OpenEBS namespace, labelled
+#     local.zfs.openebs.io/auto-managed=true).
+#   * The node fetches it (over stdin) to create the dataset and to load-key at
+#     mount. The Secret is deleted automatically when the volume is deleted.
+#
+# This is the zero-friction mode for operators / StatefulSets that create PVCs
+# on their own: every PVC gets its own unique key with nothing to set per PVC.
+#
+# Security note: the key is stored at rest in a Kubernetes Secret (etcd). Enable
+# etcd encryption at rest if that matters to you.
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: openebs-zfspv-encrypted-auto
+allowVolumeExpansion: true
+parameters:
+  poolname: "zfspv-pool"
+  fstype: "ext4"
+  encryption: "aes-256-gcm"
+  autoCreateEncryptionKey: "true"
+provisioner: zfs.csi.openebs.io
+---
+# A StatefulSet: each replica's PVC gets its own auto-generated key.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: demo
+spec:
+  serviceName: demo
+  replicas: 2
+  selector:
+    matchLabels: { app: demo }
+  template:
+    metadata:
+      labels: { app: demo }
+    spec:
+      containers:
+        - name: app
+          image: busybox
+          command: ["sh", "-c", "sleep infinity"]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        storageClassName: openebs-zfspv-encrypted-auto
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 4Gi

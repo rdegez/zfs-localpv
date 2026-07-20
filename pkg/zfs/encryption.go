@@ -28,6 +28,7 @@ import (
 	k8sapi "github.com/openebs/lib-csi/pkg/client/k8s"
 	apis "github.com/openebs/zfs-localpv/pkg/apis/openebs.io/zfs/v1"
 	corev1 "k8s.io/api/core/v1"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2"
@@ -39,6 +40,18 @@ const ZFSLoadKeyArg = "load-key"
 // PVCEncryptionSecretAnnotation is the PVC annotation naming the Secret (in the
 // PVC namespace) that holds the per-volume hex encryption key.
 const PVCEncryptionSecretAnnotation = "local.zfs.openebs.io/encryption-secret"
+
+const (
+	// AutoKeySecretPrefix prefixes the name of Secrets auto-created by the
+	// driver to hold a generated per-volume key (auto mode).
+	AutoKeySecretPrefix = "zfs-enc-"
+	// AutoKeySecretLabel marks a Secret as driver-managed, so the driver only
+	// ever adopts or takes ownership of Secrets it created itself. User-provided
+	// Secrets never carry it.
+	AutoKeySecretLabel = "local.zfs.openebs.io/auto-managed"
+	// AutoKeyVolumeLabel records the volume a driver-managed key belongs to.
+	AutoKeyVolumeLabel = "local.zfs.openebs.io/volume"
+)
 
 var (
 	kubeClientMu sync.Mutex
@@ -67,6 +80,135 @@ func getKubeClient() (kubernetes.Interface, error) {
 	}
 	kubeClient = c
 	return kubeClient, nil
+}
+
+// autoKeySecretName returns the deterministic name of the auto-created key
+// Secret for a volume.
+func autoKeySecretName(volName string) string {
+	return AutoKeySecretPrefix + volName
+}
+
+// provisionAutoKeySecret generates a per-volume key and stores it in a
+// driver-managed Secret in the given namespace, returning its name/namespace.
+// It is idempotent: if the Secret already exists (e.g. a CreateVolume retry) it
+// is reused so the key does not change.
+func provisionAutoKeySecret(client kubernetes.Interface, namespace, volName string) (string, string, error) {
+	name := autoKeySecretName(volName)
+	if existing, err := client.CoreV1().Secrets(namespace).Get(
+		context.Background(), name, metav1.GetOptions{}); err == nil {
+		// Only reuse a Secret we actually manage. Refuse to adopt a pre-existing
+		// Secret that is not labelled auto-managed, so we never silently treat a
+		// user-created Secret as the volume key.
+		if existing.Labels[AutoKeySecretLabel] != "true" {
+			return "", "", fmt.Errorf(
+				"zfs: secret %s/%s already exists and is not driver-managed (missing %s=true label); refusing to reuse it",
+				namespace, name, AutoKeySecretLabel)
+		}
+		return name, namespace, nil
+	} else if !k8serrors.IsNotFound(err) {
+		return "", "", fmt.Errorf("zfs: get auto key secret %s/%s: %w", namespace, name, err)
+	}
+
+	key, err := generateHexKey()
+	if err != nil {
+		return "", "", err
+	}
+	// The auto Secret is the ONLY copy of a driver-generated key: mark it
+	// immutable so a stray `kubectl edit`/patch can't silently corrupt the key
+	// and make the volume permanently unmountable. Cleanup on volume deletion is
+	// handled by an OwnerReference to the ZFSVolume CR (see SetAutoKeySecretOwner),
+	// which lets Kubernetes garbage-collect the Secret on every teardown path.
+	immutable := true
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+			Labels: map[string]string{
+				AutoKeySecretLabel: "true",
+				AutoKeyVolumeLabel: volName,
+			},
+		},
+		Immutable: &immutable,
+		Type:      corev1.SecretTypeOpaque,
+		Data:      map[string][]byte{encryptionSecretKeyField: []byte(key)},
+	}
+	if _, err := client.CoreV1().Secrets(namespace).Create(
+		context.Background(), secret, metav1.CreateOptions{}); err != nil {
+		if k8serrors.IsAlreadyExists(err) {
+			return name, namespace, nil
+		}
+		return "", "", fmt.Errorf("zfs: create auto key secret %s/%s: %w", namespace, name, err)
+	}
+	return name, namespace, nil
+}
+
+// SetAutoKeySecretOwner binds a driver-managed auto-key Secret to its ZFSVolume
+// CR via an OwnerReference, so Kubernetes garbage-collects the Secret whenever
+// the CR is deleted. This is the sole cleanup mechanism for the auto Secret and
+// covers every teardown path — normal DeleteVolume and out-of-band CR deletions
+// the controller never sees alike. No-op for user-provided Secrets and for
+// volumes without a managed Secret. Best-effort at the call site.
+func SetAutoKeySecretOwner(vol *apis.ZFSVolume) error {
+	if vol.Spec.EncryptionKeyRef == nil {
+		return nil
+	}
+	ns, name := vol.Spec.EncryptionKeyRef.Namespace, vol.Spec.EncryptionKeyRef.Name
+	// An OwnerReference requires the owner to be in the same namespace; auto
+	// Secrets live in the driver namespace, same as the ZFSVolume CR. User
+	// Secrets (any namespace) are handled by the label check below anyway.
+	if ns != OpenEBSNamespace {
+		return nil
+	}
+	client, err := getKubeClient()
+	if err != nil {
+		return err
+	}
+	cr, err := GetZFSVolume(vol.Name)
+	if err != nil {
+		return err
+	}
+	for attempt := 0; attempt < 5; attempt++ {
+		s, gerr := client.CoreV1().Secrets(ns).Get(context.Background(), name, metav1.GetOptions{})
+		if k8serrors.IsNotFound(gerr) {
+			return nil
+		}
+		if gerr != nil {
+			return gerr
+		}
+		if s.Labels[AutoKeySecretLabel] != "true" {
+			return nil // user-provided Secret — never take ownership of it
+		}
+		for _, o := range s.OwnerReferences {
+			if o.UID == cr.UID {
+				return nil // already owned
+			}
+		}
+		s.OwnerReferences = append(s.OwnerReferences, metav1.OwnerReference{
+			APIVersion: apis.SchemeGroupVersion.String(),
+			Kind:       "ZFSVolume",
+			Name:       cr.Name,
+			UID:        cr.UID,
+		})
+		_, uerr := client.CoreV1().Secrets(ns).Update(context.Background(), s, metav1.UpdateOptions{})
+		if uerr == nil || k8serrors.IsNotFound(uerr) {
+			return nil
+		}
+		if !k8serrors.IsConflict(uerr) {
+			return uerr
+		}
+	}
+	return fmt.Errorf("zfs: set owner on auto key secret %s/%s: too many conflicts", ns, name)
+}
+
+// ProvisionAutoKeySecret generates a per-volume key and stores it in a
+// driver-managed Secret in the OpenEBS namespace (auto mode). Returns the
+// Secret name/namespace to record on the ZFSVolume CR.
+func ProvisionAutoKeySecret(volName string) (string, string, error) {
+	client, err := getKubeClient()
+	if err != nil {
+		return "", "", err
+	}
+	return provisionAutoKeySecret(client, OpenEBSNamespace, volName)
 }
 
 // GetPVC returns the PersistentVolumeClaim identified by namespace/name.

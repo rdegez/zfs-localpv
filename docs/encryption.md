@@ -7,8 +7,9 @@ per PersistentVolume. Two families are available:
   StorageClass, via a `keylocation` file present on every node. See the
   `encryption`, `keyformat`, `keylocation` parameters in
   [storageclasses.md](./storageclasses.md).
-- **Per-volume key** — each PV gets its own key, sourced from a Kubernetes
-  Secret referenced by the PVC.
+- **Per-volume key** — each PV gets its own key, sourced either from a Kubernetes
+  Secret referenced by the PVC (bring your own key), or generated automatically
+  by the driver and stored in a managed Secret.
 
 With per-volume keys, the key material (a 32-byte key encoded as 64 hex
 characters) is **never stored in the ZFSVolume CR or on the node disk**, and is
@@ -32,7 +33,10 @@ The authoritative source remains the `ZFSVolume` CR (`spec.encryption`,
   the shipped manifests) so the controller learns the PVC name/namespace.
 - RBAC (already included in the Helm chart / operator YAML): the controller and
   node components can `get` Secrets cluster-wide (the referenced Secret can live
-  in any PVC namespace).
+  in any PVC namespace); auto mode additionally lets the controller
+  `create`/`update` Secrets, granted **namespaced** to the driver namespace only
+  (deletion is handled by Kubernetes garbage collection, so no `delete` grant is
+  needed).
 
 ---
 
@@ -93,6 +97,75 @@ Full example: [`deploy/sample/encrypted-pvc.yaml`](../deploy/sample/encrypted-pv
 
 ---
 
+## Auto-generated key (driver-managed)
+
+For zero-configuration per-volume encryption, the driver can generate the key
+itself and store it in a Secret it manages, in the OpenEBS namespace. This is the
+recommended mode for operators and StatefulSets that create PVCs on their own
+(via `volumeClaimTemplates`): each PVC gets its own unique key with **nothing to
+configure per PVC**.
+
+Opt in on the StorageClass with `autoCreateEncryptionKey: "true"`:
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: openebs-zfspv-encrypted-auto
+parameters:
+  poolname: "zfspv-pool"
+  fstype: "ext4"
+  encryption: "aes-256-gcm"
+  autoCreateEncryptionKey: "true"
+provisioner: zfs.csi.openebs.io
+```
+
+A StatefulSet then just references the StorageClass — every replica's PVC gets
+its own key:
+
+```yaml
+  volumeClaimTemplates:
+    - metadata: { name: data }
+      spec:
+        storageClassName: openebs-zfspv-encrypted-auto
+        accessModes: ["ReadWriteOnce"]
+        resources: { requests: { storage: 10Gi } }
+```
+
+Behaviour:
+- At CreateVolume the driver generates a 32-byte hex key and stores it in a
+  Secret named `zfs-enc-<volume-id>` in the OpenEBS namespace, labelled
+  `local.zfs.openebs.io/auto-managed=true`. The generation is idempotent across
+  CreateVolume retries.
+- The Secret is **garbage-collected automatically** when the volume is deleted,
+  via an OwnerReference to its ZFSVolume CR.
+
+**Security trade-off:** the key is stored at rest in a Kubernetes Secret (typically in etcd, base64-encoded). Enable
+[etcd encryption at rest](https://kubernetes.io/docs/tasks/administer-cluster/encrypt-data/)
+if this matters for your threat model.
+
+The managed Secret is the only copy of the generated key, so it is protected two
+ways: **`immutable: true`** (blocks an accidental `kubectl edit`/patch that would
+silently corrupt the key and make the volume unmountable) and an
+**OwnerReference** to its ZFSVolume CR, which makes the Kubernetes garbage
+collector reap the Secret automatically on every volume-deletion path (normal
+teardown and out-of-band CR deletion alike) — no finalizer, and no explicit
+delete. Do **not** manually `kubectl delete` the `zfs-enc-<volume>` Secret while
+its PVC exists: it is the sole copy of the key, and removing it makes the volume
+permanently unmountable.
+
+The two per-volume modes are evaluated in precedence order, so a **single
+StorageClass can serve both "bring your own key" and "auto" users**: the PVC
+annotation (Secret mode) takes precedence, else `autoCreateEncryptionKey: "true"`
+auto-generates a key. A developer who sets the annotation overrides the auto
+behaviour for their PVC. If the annotation references a missing or invalid
+Secret, provisioning fails immediately (it does **not** silently fall back to
+auto-generation).
+
+Full example: [`deploy/sample/encrypted-pvc-auto.yaml`](../deploy/sample/encrypted-pvc-auto.yaml).
+
+---
+
 ## Key rotation (manual)
 
 Automated rotation is intentionally **not** performed by the driver: there is no
@@ -125,7 +198,10 @@ between the two steps leaves a recoverable state.
 - gRPC request/response logging strips secrets, and the key is passed to `zfs`
   on stdin, so it never appears in process arguments or logs.
 - The controller and node are granted cluster-wide `get` (not `list`) on Secrets
-  because a referenced Secret can live in any PVC namespace.
+  because a referenced Secret can live in any PVC namespace. Auto-mode
+  `create`/`update` on Secrets is granted **namespaced** to the driver namespace
+  only (`openebs-zfs-provisioner-secrets-role`), not cluster-wide; no `delete`
+  grant is needed since the Secret is garbage-collected via its OwnerReference.
 
 ## Limitations
 
