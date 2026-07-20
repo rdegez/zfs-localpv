@@ -18,6 +18,7 @@ package zfs
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -28,6 +29,7 @@ import (
 	k8sapi "github.com/openebs/lib-csi/pkg/client/k8s"
 	apis "github.com/openebs/zfs-localpv/v2/pkg/apis/openebs.io/zfs/v1"
 	corev1 "k8s.io/api/core/v1"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2"
@@ -39,6 +41,23 @@ const ZFSLoadKeyArg = "load-key"
 // PVCEncryptionSecretAnnotation is the PVC annotation naming the Secret (in the
 // PVC namespace) that holds the per-volume hex encryption key.
 const PVCEncryptionSecretAnnotation = "encryption.openebs.io/secret-name"
+
+const (
+	// AutoKeySecretPrefix prefixes the name of Secrets auto-created by the
+	// driver to hold a generated per-volume key (auto mode).
+	AutoKeySecretPrefix = "zfs-enc-"
+	// AutoKeySecretLabel marks a Secret as driver-managed, so the driver only
+	// ever adopts or deletes Secrets it created itself. User-provided Secrets
+	// never carry it.
+	AutoKeySecretLabel = "encryption.openebs.io/auto-managed"
+	// AutoKeyVolumeLabel records the volume a driver-managed key belongs to.
+	AutoKeyVolumeLabel = "encryption.openebs.io/volume"
+	// autoKeyVolumeField repeats the volume name in the data of a driver-managed
+	// key Secret: templates of tools that copy Secrets to an external KMS, such as
+	// the External Secrets Operator's PushSecret, only see the data, and need it
+	// to store each key under its own name.
+	autoKeyVolumeField = "volume"
+)
 
 var (
 	kubeClientMu sync.Mutex
@@ -68,6 +87,189 @@ func getKubeClient() (kubernetes.Interface, error) {
 	}
 	kubeClient = c
 	return kubeClient, nil
+}
+
+// autoKeySecretName returns the deterministic name of the auto-created key
+// Secret for a volume.
+func autoKeySecretName(volName string) string {
+	return AutoKeySecretPrefix + volName
+}
+
+// provisionAutoKeySecret generates a per-volume key and stores it in a
+// driver-managed Secret in the given namespace, returning its name/namespace.
+// It is idempotent: if the Secret already exists (e.g. a CreateVolume retry) it
+// is reused so the key does not change.
+func provisionAutoKeySecret(client kubernetes.Interface, namespace, volName string) (string, string, error) {
+	name := autoKeySecretName(volName)
+	if existing, err := client.CoreV1().Secrets(namespace).Get(
+		context.Background(), name, metav1.GetOptions{}); err == nil {
+		// Only reuse a Secret we actually manage. Refuse to adopt a pre-existing
+		// Secret that is not labelled auto-managed, so we never silently treat a
+		// user-created Secret as the volume key.
+		if existing.Labels[AutoKeySecretLabel] != "true" {
+			return "", "", fmt.Errorf(
+				"zfs: secret %s/%s already exists and is not driver-managed (missing %s=true label); refusing to reuse it",
+				namespace, name, AutoKeySecretLabel)
+		}
+		return name, namespace, nil
+	} else if !k8serrors.IsNotFound(err) {
+		return "", "", fmt.Errorf("zfs: get auto key secret %s/%s: %w", namespace, name, err)
+	}
+
+	key, err := generateHexKey()
+	if err != nil {
+		return "", "", err
+	}
+	// The auto Secret is the ONLY copy of a driver-generated key: mark it
+	// immutable so a stray `kubectl edit`/patch can't silently corrupt the key
+	// and make the volume permanently unmountable. It is deleted by the node
+	// agent only once the dataset itself is destroyed (see RemoveAutoKeySecret).
+	immutable := true
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+			Labels: map[string]string{
+				AutoKeySecretLabel: "true",
+				AutoKeyVolumeLabel: volName,
+			},
+		},
+		Immutable: &immutable,
+		Type:      corev1.SecretTypeOpaque,
+		Data: map[string][]byte{
+			encryptionSecretKeyField: []byte(key),
+			autoKeyVolumeField:       []byte(volName),
+		},
+	}
+	if _, err := client.CoreV1().Secrets(namespace).Create(
+		context.Background(), secret, metav1.CreateOptions{}); err != nil {
+		if k8serrors.IsAlreadyExists(err) {
+			return name, namespace, nil
+		}
+		return "", "", fmt.Errorf("zfs: create auto key secret %s/%s: %w", namespace, name, err)
+	}
+	klog.Infof("zfs: created the encryption key secret %s/%s for volume %s", namespace, name, volName)
+	return name, namespace, nil
+}
+
+// AutoKeySecretName returns the name of the driver-managed Secret holding the
+// generated key of the given volume (auto mode).
+func AutoKeySecretName(volName string) string {
+	return autoKeySecretName(volName)
+}
+
+// ownsAutoKeySecret reports whether vol owns a driver-managed key Secret, i.e.
+// its key reference points at the auto Secret named after the volume itself, in
+// the driver namespace. A clone shares its parent's key Secret and therefore
+// does not own it: it never creates nor deletes it.
+func ownsAutoKeySecret(vol *apis.ZFSVolume) bool {
+	ref := vol.Spec.EncryptionKeyRef
+	return ref != nil && ref.Namespace == OpenEBSNamespace && ref.Name == autoKeySecretName(vol.Name)
+}
+
+// EnsureAutoKeySecret creates the volume's driver-managed key Secret if the
+// volume owns one and it does not exist yet. It runs on the node right before
+// the dataset is created, so a key only ever exists alongside its data. It is
+// idempotent, and refuses to adopt a pre-existing Secret it did not create.
+func EnsureAutoKeySecret(vol *apis.ZFSVolume) error {
+	if !ownsAutoKeySecret(vol) {
+		return nil
+	}
+	client, err := getKubeClient()
+	if err != nil {
+		return err
+	}
+	_, _, err = provisionAutoKeySecret(client, OpenEBSNamespace, vol.Name)
+	return err
+}
+
+// RemoveAutoKeySecret deletes the volume's driver-managed key Secret once its
+// dataset has been destroyed: the key is deleted together with the data, never
+// before. Deleting a key cannot be undone, so it requires positive proof that
+// the dataset is gone: its parent dataset is available and `zfs list` reports
+// the dataset as missing. Any other outcome keeps the key and returns an error,
+// so the caller retries. A ZFSVolume removed without destroying its dataset (for
+// example after its finalizer was removed to keep the data) therefore keeps its
+// key. No-op for user-provided Secrets, for a clone sharing its parent's key, and
+// when the Secret is already gone.
+func RemoveAutoKeySecret(vol *apis.ZFSVolume) error {
+	if !ownsAutoKeySecret(vol) {
+		return nil
+	}
+	volume := vol.Spec.PoolName + "/" + vol.Name
+	if err := getVolume(vol.Spec.PoolName); err != nil {
+		return fmt.Errorf("zfs: keeping the encryption key of %s, its parent dataset is not available: %w", volume, err)
+	}
+	missing, err := datasetMissing(volume)
+	if err != nil {
+		return fmt.Errorf("zfs: keeping the encryption key of %s, cannot confirm that its dataset is gone: %w", volume, err)
+	}
+	if !missing {
+		return fmt.Errorf("zfs: keeping the encryption key of %s, its dataset still exists", volume)
+	}
+	return deleteAutoKeySecret(vol)
+}
+
+// deleteAutoKeySecret deletes the volume's driver-managed key Secret, with no
+// check on its dataset: callers must have established that the dataset does not
+// exist.
+func deleteAutoKeySecret(vol *apis.ZFSVolume) error {
+	if !ownsAutoKeySecret(vol) {
+		return nil
+	}
+	client, err := getKubeClient()
+	if err != nil {
+		return err
+	}
+	return removeAutoKeySecret(client, OpenEBSNamespace, vol.Name)
+}
+
+// datasetMissing reports whether `zfs list` positively says that the dataset
+// does not exist. Any other failure is returned as an error, so that callers can
+// tell "gone" from "unknown".
+func datasetMissing(dataset string) (bool, error) {
+	err := getVolume(dataset)
+	if err == nil {
+		return false, nil
+	}
+	if isDatasetMissing(err) {
+		return true, nil
+	}
+	return false, err
+}
+
+// isDatasetMissing reports whether err is a zfs error saying that the dataset
+// does not exist. NOTE: this matches OpenZFS error-message text ("cannot open
+// '<dataset>': dataset does not exist"); revisit on major ZFS bumps.
+func isDatasetMissing(err error) bool {
+	var zerr *Error
+	return errors.As(err, &zerr) && strings.Contains(zerr.Stderr, "dataset does not exist")
+}
+
+func removeAutoKeySecret(client kubernetes.Interface, namespace, volName string) error {
+	name := autoKeySecretName(volName)
+	s, err := client.CoreV1().Secrets(namespace).Get(context.Background(), name, metav1.GetOptions{})
+	if k8serrors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("zfs: get auto key secret %s/%s: %w", namespace, name, err)
+	}
+	if s.Labels[AutoKeySecretLabel] != "true" {
+		// Never delete a Secret the driver did not create.
+		klog.Warningf("zfs: secret %s/%s is not driver-managed (missing %s=true label); leaving it in place",
+			namespace, name, AutoKeySecretLabel)
+		return nil
+	}
+	// Precondition on the UID so a Secret recreated in the meantime is not hit.
+	uid := s.UID
+	err = client.CoreV1().Secrets(namespace).Delete(context.Background(), name,
+		metav1.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &uid}})
+	if err != nil && !k8serrors.IsNotFound(err) {
+		return fmt.Errorf("zfs: delete auto key secret %s/%s: %w", namespace, name, err)
+	}
+	klog.Infof("zfs: deleted the encryption key secret %s/%s of volume %s, whose dataset does not exist", namespace, name, volName)
+	return nil
 }
 
 // GetPVC returns the PersistentVolumeClaim identified by namespace/name.
