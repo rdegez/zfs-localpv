@@ -398,3 +398,16 @@ func waitForDevice(ctx context.Context, device string, timeout time.Duration) er
 		}
 	}
 }
+
+// EnsureParentKeyLoaded loads the key of a clone's source, which zfs clone needs,
+// e.g. after a reboot.
+func EnsureParentKeyLoaded(vol *apis.ZFSVolume) error {
+	if !UsesManagedKey(vol) || vol.Spec.SnapName == "" {
+		return nil
+	}
+	src := strings.SplitN(vol.Spec.SnapName, "@", 2)[0]
+	if src == "" {
+		return nil
+	}
+	return loadKeyForDataset(vol, vol.Spec.PoolName+"/"+src)
+}

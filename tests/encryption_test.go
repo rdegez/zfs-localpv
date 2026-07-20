@@ -33,6 +33,7 @@ var _ = Describe("[zfspv] TEST PER-VOLUME ENCRYPTION", func() {
 	Context("App is deployed with zfs driver", func() {
 		It("Running per-volume encryption test with a key Secret", encryptionSecretModeTest)
 		It("Running per-volume encryption test with generated keys", encryptionAutoModeTest)
+		It("Running clone tests of per-volume encrypted volumes", encryptionCloneTest)
 	})
 })
 
@@ -41,11 +42,16 @@ const (
 	encAutoSCName   = "zfspv-sc-enc-auto"
 	encPlainSCName  = "zfspv-sc-enc-plain"
 	encKeySecret    = "zfspv-enc-key"
+	encOtherSecret  = "zfspv-enc-other-key"
 	encPvcName      = "zfspv-pvc-enc"
 	encAppName      = "busybox-zfspv-enc"
+	encSnapName     = "zfspv-snap-enc"
 	encAutoPvcName1 = "zfspv-pvc-enc-auto-1"
 	encAutoPvcName2 = "zfspv-pvc-enc-auto-2"
 	encAutoAppName  = "busybox-zfspv-enc-auto"
+	encClonePvcName = "zfspv-pvc-enc-clone"
+	encCloneAppName = "busybox-zfspv-enc-clone"
+	encVolClonePvc  = "zfspv-pvc-enc-vol-clone"
 
 	encVAPName = "openebs-zfs-protect-encryption-keys"
 )
@@ -256,4 +262,52 @@ func encryptionAutoModeTest() {
 	deleteAppDeployment(encAutoAppName)
 	deletePVC(encAutoPvcName2)
 	deleteStorageClassByName(encAutoSCName)
+}
+
+func encryptionCloneTest() {
+	createKeySecret(encKeySecret)
+	createKeySecret(encOtherSecret)
+	kubectlApply(encStorageClass(encSCName, map[string]string{"encryption": "aes-256-gcm"}))
+	keyAnnotation := map[string]string{zfs.PVCEncryptionSecretAnnotation: encKeySecret}
+	otherAnnotation := map[string]string{zfs.PVCEncryptionSecretAnnotation: encOtherSecret}
+
+	createBoundEncPVC(encPvcName, encSCName, keyAnnotation, "")
+	By("Creating and deploying app pod", func() { createDeployVerifyApp(encAppName, encPvcName) })
+
+	createSnapshot(encPvcName, encSnapName)
+	verifySnapshotCreated(encSnapName)
+
+	createBoundEncPVC(encClonePvcName, encSCName, nil, "snapshot/"+encSnapName)
+	By("Creating and deploying clone app pod", func() { createDeployVerifyCloneApp(encCloneAppName, encClonePvcName) })
+	createBoundEncPVC(encVolClonePvc, encSCName, keyAnnotation, encPvcName)
+
+	By("verifying the clones share their source's key", func() {
+		for _, pvcName := range []string{encClonePvcName, encVolClonePvc} {
+			name, ns := encKeyRef(pvcName)
+			Expect(name).To(Equal(encKeySecret))
+			Expect(ns).To(Equal(OpenEBSNamespace))
+			Expect(encMarker(pvcName)).To(Equal(zfs.EncryptedVolume))
+		}
+	})
+
+	expectProvisioningRejected("zfspv-pvc-enc-restore-other", encSCName, otherAnnotation,
+		"snapshot/"+encSnapName, "always uses its source's encryption key")
+	expectProvisioningRejected("zfspv-pvc-enc-clone-other", encSCName, otherAnnotation,
+		encPvcName, "always uses its source's encryption key")
+
+	By("Deleting clone application deployment")
+	deleteAppDeployment(encCloneAppName)
+	By("Deleting clone pvcs")
+	deletePVC(encClonePvcName)
+	deletePVC(encVolClonePvc)
+	By("Deleting snapshot")
+	deleteSnapshot(encPvcName, encSnapName)
+	By("Deleting main application deployment")
+	deleteAppDeployment(encAppName)
+	By("Deleting main pvc")
+	deletePVC(encPvcName)
+
+	deleteKeySecret(encOtherSecret)
+	deleteKeySecret(encKeySecret)
+	deleteStorageClassByName(encSCName)
 }

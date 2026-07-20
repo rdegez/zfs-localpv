@@ -121,3 +121,21 @@ func TestEncryptedMarker(t *testing.T) {
 		}
 	}
 }
+
+// The guards of EnsureParentKeyLoaded return before running any zfs command.
+func TestEnsureParentKeyLoadedGuards(t *testing.T) {
+	ref := &apis.EncryptionKeyReference{Name: "db-key", Namespace: "apps"}
+	tests := []struct {
+		name string
+		spec apis.VolumeInfo
+	}{
+		{"no per-volume key", apis.VolumeInfo{SnapName: "pvc-a@snap"}},
+		{"not a clone", apis.VolumeInfo{EncryptionKeyRef: ref}},
+		{"no source volume", apis.VolumeInfo{EncryptionKeyRef: ref, SnapName: "@snap"}},
+	}
+	for _, tt := range tests {
+		if err := EnsureParentKeyLoaded(&apis.ZFSVolume{Spec: tt.spec}); err != nil {
+			t.Errorf("%s: EnsureParentKeyLoaded = %v, want nil", tt.name, err)
+		}
+	}
+}

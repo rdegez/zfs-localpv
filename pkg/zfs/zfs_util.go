@@ -637,6 +637,10 @@ func CreateClone(vol *apis.ZFSVolume) error {
 	}
 
 	if err := getVolume(volume); err != nil {
+		// zfs clone needs the source key loaded, e.g. after a reboot
+		if err := EnsureParentKeyLoaded(vol); err != nil {
+			return err
+		}
 		args := buildCloneCreateArgs(vol)
 		cmd := exec.Command(ZFSVolCmd, args...)
 		out, err := runCmd(cmd, volume)
