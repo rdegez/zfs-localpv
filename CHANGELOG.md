@@ -40,6 +40,11 @@ before creating the dataset, and deletes it once the dataset is destroyed. A
 ValidatingAdmissionPolicy shipped with the chart (Kubernetes 1.30+,
 `encryptionKeyProtection.enabled`) protects these Secrets from deletion, and is
 kept on `helm uninstall`.
+ - Clones of volumes with a per-volume key
+Clones and restores of a volume with a per-volume key share its key; the node
+loads the source key before cloning, so cloning also works right after a node
+reboot. A clone or a restore whose PVC names another key Secret than its
+source's is rejected with `InvalidArgument`.
 
 Behaviour Changes
 

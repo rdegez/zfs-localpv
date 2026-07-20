@@ -296,6 +296,44 @@ To keep the key material out of etcd, enable
 
 ---
 
+## Snapshots and clones
+
+Snapshots of an encrypted volume are encrypted with it. Clones, from a volume or
+from a snapshot, inherit the parent's encryption root and key source: the node
+loads the parent key before `zfs clone`, so cloning also works right after a node
+reboot, and the clone loads the same key at mount.
+
+The key source travels with the snapshot: its `ZFSSnapshot` CR carries a copy of
+the volume's spec, `encryptionKeyRef` included. A clone or a restore cannot pick
+another key: if its PVC carries an `encryption.openebs.io/secret-name`
+annotation naming another Secret than the source's, provisioning fails with
+`InvalidArgument`.
+
+## Backup and restore (Velero): not supported
+
+Backup and restore of volumes that use a per-volume key are **not supported**. In
+zfs-localpv, backup and restore are driven by the `ZFSBackup` / `ZFSRestore` CRs,
+which the OpenEBS Velero plugin (`openebs/velero-plugin`) creates. Tested with
+Velero 1.14 and velero-plugin 3.6.0:
+
+- **Restore fails.** The plugin rebuilds the restored `ZFSVolume` from the saved
+  object with its own copy of the zfs-localpv API types, which predates the
+  per-volume key fields. The key source is dropped, so the driver has no key to
+  hand to `zfs recv`, and the receive fails with `Cannot use 'prompt' keylocation
+  because stdin is in use`.
+- **Backups are not encrypted.** The backup path streams a non-raw `zfs send`,
+  which ZFS decrypts on the fly: the data leaves the node and reaches the object
+  store in clear text, and deleting a volume's key does not make its backups
+  unreadable. This applies to the legacy StorageClass encryption too.
+
+Supporting it needs changes outside this driver (an updated Velero plugin) and a
+design for encrypted backups: a raw `zfs send -w` keeps the stream encrypted,
+but restoring it requires the volume's original key, which the auto-generated
+key mode deletes together with the volume unless it was backed up to a KMS (see
+above). Until then, back up such volumes at the application level.
+
+---
+
 ## Key rotation (manual)
 
 Automated rotation is intentionally **not** performed by the driver: there is no
@@ -365,6 +403,8 @@ the auto mode are immutable and are not meant to be rotated.
   key there. Do not delete that namespace, or reinstall the driver in another
   one, while volumes use generated keys: back the keys up first (see *Keeping
   keys in an external KMS*).
+- **Backup and restore through Velero are not supported** — see *Backup and
+  restore (Velero): not supported*.
 
 The legacy `keylocation`-file StorageClass encryption continues to work unchanged
 alongside per-volume keys.
