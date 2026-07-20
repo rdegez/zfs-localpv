@@ -1,0 +1,71 @@
+{{- if and .Values.encryptionKeyProtection.enabled (.Capabilities.APIVersions.Has "admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy") }}
+# A driver-managed encryption key Secret (autoCreateEncryptionKey) holds the
+# only copy of a volume's key: deleting it makes the volume unreadable. Deny its
+# deletion to everyone but the node agent, which deletes a key once the volume's
+# dataset is destroyed, and deny removing its label, which would bypass this
+# policy. Break-glass: annotate the Secret with
+# encryption.openebs.io/allow-key-deletion: "true".
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: openebs-zfs-protect-encryption-keys
+  annotations:
+    # Kept on helm uninstall: the keys outlive the driver and stay protected.
+    helm.sh/resource-policy: keep
+  labels:
+    {{- include "zfslocalpv.zfsNode.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["UPDATE", "DELETE"]
+        resources: ["secrets"]
+  matchConditions:
+    # Key presence is checked before reading it: reading a missing map key is an
+    # evaluation error, which failurePolicy Fail would turn into a denial.
+    - name: driver-managed-key
+      expression: >-
+        has(oldObject.metadata.labels) &&
+        'encryption.openebs.io/auto-managed' in oldObject.metadata.labels &&
+        oldObject.metadata.labels['encryption.openebs.io/auto-managed'] == 'true'
+    - name: protection-not-lifted
+      expression: >-
+        !(has(oldObject.metadata.annotations) &&
+        'encryption.openebs.io/allow-key-deletion' in oldObject.metadata.annotations &&
+        oldObject.metadata.annotations['encryption.openebs.io/allow-key-deletion'] == 'true')
+  validations:
+    - expression: >-
+        request.operation != 'DELETE' ||
+        request.userInfo.username == 'system:serviceaccount:{{ .Release.Namespace }}:{{ .Values.serviceAccount.zfsNode.name }}'
+      message: >-
+        this Secret holds the encryption key of an existing ZFS volume and cannot be deleted;
+        annotate it with encryption.openebs.io/allow-key-deletion=true to lift the protection
+    - expression: >-
+        request.operation != 'UPDATE' ||
+        (has(object.metadata.labels) &&
+        'encryption.openebs.io/auto-managed' in object.metadata.labels &&
+        object.metadata.labels['encryption.openebs.io/auto-managed'] == 'true')
+      message: >-
+        this Secret holds the encryption key of an existing ZFS volume and its
+        encryption.openebs.io/auto-managed label cannot be removed; annotate it with
+        encryption.openebs.io/allow-key-deletion=true to lift the protection
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: openebs-zfs-protect-encryption-keys
+  annotations:
+    # Kept on helm uninstall: the keys outlive the driver and stay protected.
+    helm.sh/resource-policy: keep
+  labels:
+    {{- include "zfslocalpv.zfsNode.labels" . | nindent 4 }}
+spec:
+  policyName: openebs-zfs-protect-encryption-keys
+  validationActions: [Deny]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: {{ .Release.Namespace }}
+{{- end }}

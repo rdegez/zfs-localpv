@@ -172,6 +172,38 @@ roleRef:
   kind: ClusterRole
   name: openebs-zfs-driver-registrar-role
   apiGroup: rbac.authorization.k8s.io
+---
+# Auto mode (autoCreateEncryptionKey): the node agent creates a volume's key
+# Secret right before creating its dataset, and deletes it once the dataset is
+# destroyed. Those Secrets live in the driver's own namespace, so the write
+# verbs are granted there only, not cluster-wide.
+kind: Role
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: openebs-zfs-node-secrets-role
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "zfslocalpv.zfsNode.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create", "delete"]
+---
+kind: RoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: openebs-zfs-node-secrets-binding
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "zfslocalpv.zfsNode.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Values.serviceAccount.zfsNode.name }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: Role
+  name: openebs-zfs-node-secrets-role
+  apiGroup: rbac.authorization.k8s.io
 
 {{- if .Values.rbac.pspEnabled }}
 ---

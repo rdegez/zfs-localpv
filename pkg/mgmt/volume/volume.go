@@ -84,6 +84,11 @@ func (c *ZVController) syncZV(zv *apis.ZFSVolume) error {
 			err = zfs.DestroyVolume(zv)
 			if err == nil {
 				zfs.EmitSuccessEvent(c.recorder, zv, zfs.ReasonDestroyed, "volume destroyed")
+				// the data is gone: delete the generated key before releasing the CR
+				if err = zfs.RemoveAutoKeySecret(zv); err != nil {
+					zfs.EmitFailureEvent(c.recorder, zv, zfs.ReasonDestroyFailed, err)
+					return err
+				}
 				err = zfs.RemoveVolumeFinalizer(zv)
 			} else {
 				zfs.EmitFailureEvent(c.recorder, zv, zfs.ReasonDestroyFailed, err)
