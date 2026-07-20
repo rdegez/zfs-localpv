@@ -75,6 +75,13 @@ func getKubeClient() (kubernetes.Interface, error) {
 	if err != nil {
 		return nil, fmt.Errorf("zfs: failed to build kubeconfig: %w", err)
 	}
+	// This shared client backs a volume's key material: reading the Secret / KMS
+	// ConfigMap on every provision and load-key, and also creating/updating the
+	// driver-managed auto Secret (Mode 3). The client-go defaults (QPS 5, Burst
+	// 10) throttle hard when many encrypted volumes are provisioned or remounted
+	// at once (e.g. after a node reboot), so raise them.
+	cfg.QPS = 100
+	cfg.Burst = 200
 	c, err := kubernetes.NewForConfig(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("zfs: failed to build kube client: %w", err)
