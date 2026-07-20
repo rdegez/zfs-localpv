@@ -565,9 +565,16 @@ func CreateVolume(vol *apis.ZFSVolume) error {
 		// keylocation=prompt and the key is fed on stdin, so it never touches
 		// the CR, etcd or the node disk.
 		if UsesManagedKey(vol) && len(vol.Spec.Encryption) != 0 {
+			// Auto mode: the node creates the volume's key Secret right before
+			// the dataset, so a key only ever exists alongside its data.
+			if kerr := EnsureAutoKeySecret(vol); kerr != nil {
+				klog.Errorf("zfs: could not create the encryption key secret for %v error: %s", volume, kerr)
+				return kerr
+			}
 			key, kerr := FetchEncryptionKey(vol)
 			if kerr != nil {
 				klog.Errorf("zfs: could not resolve encryption key for %v error: %s", volume, kerr)
+				discardAutoKeySecret(vol, volume)
 				return kerr
 			}
 			cmd.Stdin = strings.NewReader(key + "\n")
@@ -578,6 +585,7 @@ func CreateVolume(vol *apis.ZFSVolume) error {
 		if err != nil {
 			zerr := NewZFSError("zfs create", volume, err, out)
 			klog.Errorf("zfs: could not create volume %v cmd %v error: %s", volume, args, zerr)
+			discardAutoKeySecret(vol, volume)
 			return zerr
 		}
 		klog.Infof("created volume %s", volume)
@@ -586,6 +594,21 @@ func CreateVolume(vol *apis.ZFSVolume) error {
 	}
 
 	return nil
+}
+
+// discardAutoKeySecret deletes the driver-managed key (auto mode) of a volume
+// whose dataset could not be created. The ZFSVolume of a failed volume carries no
+// finalizer, so its deletion never reaches the destroy path that deletes the key:
+// without this, a PVC deleted while its provisioning keeps failing would leave its
+// key behind. The key is kept if the dataset exists anyway. A retry creates a new
+// key.
+func discardAutoKeySecret(vol *apis.ZFSVolume, volume string) {
+	if getVolume(volume) == nil {
+		return
+	}
+	if err := RemoveAutoKeySecret(vol); err != nil {
+		klog.Errorf("zfs: could not delete the encryption key secret of %v after a failed creation, error: %s", volume, err)
+	}
 }
 
 // CreateClone creates clone for the zvol/dataset as per
