@@ -246,6 +246,31 @@ func FetchEncryptionKey(vol *apis.ZFSVolume) (string, error) {
 	return fetchKeyFromSecret(ref.Namespace, ref.Name)
 }
 
+// writeTempKeyFile writes the hex key to a transient 0600 file and returns its
+// path. The caller is responsible for removing it.
+func writeTempKeyFile(key string) (string, error) {
+	f, err := os.CreateTemp("", "zfs-enc-key-")
+	if err != nil {
+		return "", fmt.Errorf("zfs: create temp key file: %w", err)
+	}
+	name := f.Name()
+	if err := f.Chmod(0600); err != nil {
+		_ = f.Close()
+		_ = os.Remove(name)
+		return "", err
+	}
+	if _, err := f.WriteString(key); err != nil {
+		_ = f.Close()
+		_ = os.Remove(name)
+		return "", err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(name)
+		return "", err
+	}
+	return name, nil
+}
+
 // SetKeyLocationPrompt sets keylocation=prompt on a dataset so subsequent
 // `zfs load-key` operations read the key from stdin.
 func SetKeyLocationPrompt(dataset string) error {
@@ -407,4 +432,19 @@ func waitForDevice(ctx context.Context, device string, timeout time.Duration) er
 			}
 		}
 	}
+}
+
+// EnsureParentKeyLoaded loads the key for the dataset a clone is derived from,
+// so `zfs clone` (which requires the parent key to be available) succeeds even
+// after a node reboot. vol is the clone's ZFSVolume (its Spec carries the same
+// key source as the parent, since clones inherit it).
+func EnsureParentKeyLoaded(vol *apis.ZFSVolume) error {
+	if !UsesManagedKey(vol) || vol.Spec.SnapName == "" {
+		return nil
+	}
+	src := strings.SplitN(vol.Spec.SnapName, "@", 2)[0]
+	if src == "" {
+		return nil
+	}
+	return loadKeyForDataset(vol, vol.Spec.PoolName+"/"+src)
 }

@@ -246,7 +246,7 @@ func TestBuildVolumeRestoreArgs(t *testing.T) {
 			LogBias:     "throughput",
 		},
 	}
-	ncArgs, recvArgs, err := buildVolumeRestoreArgs(rstr)
+	ncArgs, recvArgs, err := buildVolumeRestoreArgs(rstr, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -319,7 +319,7 @@ func TestBuildVolumeRestoreArgsPropertyTokenization(t *testing.T) {
 		},
 	}
 
-	_, recvArgs, err := buildVolumeRestoreArgs(rstr)
+	_, recvArgs, err := buildVolumeRestoreArgs(rstr, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

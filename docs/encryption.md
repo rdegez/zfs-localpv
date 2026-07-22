@@ -166,6 +166,19 @@ Full example: [`deploy/sample/encrypted-pvc-auto.yaml`](../deploy/sample/encrypt
 
 ---
 
+## Snapshots, clones, backup/restore
+
+- **Clones** (from a volume or a snapshot) inherit the parent's encryption root
+  and its key source. The node ensures the parent key is loaded before
+  `zfs clone`, and the clone loads the (shared) key at mount.
+- **Backup/restore** (Velero via `zfs send | nc` / `nc | zfs recv`): an
+  encrypted restore fetches the key and hands it to `zfs recv` through a
+  transient `0600` key file (recv's stdin carries the data stream, so `prompt`
+  cannot be used during receive). After the receive, the dataset is switched
+  back to `keylocation=prompt` and the temp file removed.
+
+---
+
 ## Key rotation (manual)
 
 Automated rotation is intentionally **not** performed by the driver: there is no
@@ -209,6 +222,10 @@ between the two steps leaves a recoverable state.
   The legacy StorageClass `keyformat` (`passphrase`/`raw`/`hex`) is unaffected.
 - Key rotation is manual (see above) — the driver performs no automatic rotation
   for either the per-volume or the legacy StorageClass encryption.
+- **Backup/restore under a new volume name**: the per-volume key is looked up by
+  the volume's own name/Secret reference. Restoring an encrypted volume under a
+  *different* name (e.g. some Velero flows) will not find the original key —
+  restore preserving the volume name, or pre-provision the key under the new name.
 
 The legacy `keylocation`-file StorageClass encryption continues to work unchanged
 alongside per-volume keys.
