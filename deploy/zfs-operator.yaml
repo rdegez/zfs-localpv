@@ -2721,6 +2721,49 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
 ---
 # Source: zfs-localpv/templates/rbac.yaml
+# Auto mode (autoCreateEncryptionKey) creates driver-managed key Secrets only in
+# the driver's own namespace, so these verbs are granted namespaced here rather
+# than cluster-wide. Deletion is handled by Kubernetes garbage collection via an
+# OwnerReference to the ZFSVolume CR, so no delete verb is needed; update is used
+# only to attach that OwnerReference.
+kind: Role
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: openebs-zfs-provisioner-secrets-role
+  namespace: kube-system
+  labels:
+    openebs.io/version: "2.11.0-develop"
+    role: "openebs-zfs"
+    app: "openebs-zfs-controller"
+    component: "openebs-zfs-controller"
+    openebs.io/component-name: "openebs-zfs-controller"
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "create", "update"]
+---
+# Source: zfs-localpv/templates/rbac.yaml
+kind: RoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: openebs-zfs-provisioner-secrets-binding
+  namespace: kube-system
+  labels:
+    openebs.io/version: "2.11.0-develop"
+    role: "openebs-zfs"
+    app: "openebs-zfs-controller"
+    component: "openebs-zfs-controller"
+    openebs.io/component-name: "openebs-zfs-controller"
+subjects:
+  - kind: ServiceAccount
+    name: openebs-zfs-controller-sa
+    namespace: kube-system
+roleRef:
+  kind: Role
+  name: openebs-zfs-provisioner-secrets-role
+  apiGroup: rbac.authorization.k8s.io
+---
+# Source: zfs-localpv/templates/rbac.yaml
 kind: ClusterRoleBinding
 apiVersion: rbac.authorization.k8s.io/v1
 metadata:
