@@ -186,7 +186,12 @@ func buildZvolCreateArgs(vol *apis.ZFSVolume) []string {
 		encryptionProperty := "encryption=" + vol.Spec.Encryption
 		ZFSVolArg = append(ZFSVolArg, "-o", encryptionProperty)
 	}
-	if len(vol.Spec.KeyLocation) != 0 {
+	// When the key is managed by the driver (a Secret reference), the key is
+	// piped to `zfs create` via stdin, so the keylocation is set to "prompt".
+	// Otherwise fall back to the legacy keylocation-file mode from the spec.
+	if UsesManagedKey(vol) {
+		ZFSVolArg = append(ZFSVolArg, "-o", "keylocation=prompt")
+	} else if len(vol.Spec.KeyLocation) != 0 {
 		keyLocation := "keylocation=" + vol.Spec.KeyLocation
 		ZFSVolArg = append(ZFSVolArg, "-o", keyLocation)
 	}
@@ -313,7 +318,10 @@ func buildDatasetCreateArgs(vol *apis.ZFSVolume) []string {
 		encryptionProperty := "encryption=" + vol.Spec.Encryption
 		ZFSVolArg = append(ZFSVolArg, "-o", encryptionProperty)
 	}
-	if len(vol.Spec.KeyLocation) != 0 {
+	// See buildZvolCreateArgs: managed keys are piped via stdin (keylocation=prompt).
+	if UsesManagedKey(vol) {
+		ZFSVolArg = append(ZFSVolArg, "-o", "keylocation=prompt")
+	} else if len(vol.Spec.KeyLocation) != 0 {
 		keyLocation := "keylocation=" + vol.Spec.KeyLocation
 		ZFSVolArg = append(ZFSVolArg, "-o", keyLocation)
 	}
@@ -509,6 +517,19 @@ func CreateVolume(vol *apis.ZFSVolume) error {
 			args = buildZvolCreateArgs(vol)
 		}
 		cmd := exec.Command(ZFSVolCmd, args...)
+
+		// For a driver-managed encryption key the dataset is created with
+		// keylocation=prompt and the key is fed on stdin, so it never touches
+		// the CR, etcd or the node disk.
+		if UsesManagedKey(vol) && len(vol.Spec.Encryption) != 0 {
+			key, kerr := FetchEncryptionKey(vol)
+			if kerr != nil {
+				klog.Errorf("zfs: could not resolve encryption key for %v error: %s", volume, kerr)
+				return kerr
+			}
+			cmd.Stdin = strings.NewReader(key + "\n")
+		}
+
 		out, err := runCmd(cmd, volume)
 
 		if err != nil {
@@ -984,12 +1005,12 @@ func CreateRestore(rstr *apis.ZFSRestore) error {
 		}
 		rstr.VolSpec = vol.Spec
 	}
+	volume := rstr.VolSpec.PoolName + "/" + rstr.Spec.VolumeName
+
 	ncArgs, recvArgs, err := buildVolumeRestoreArgs(rstr)
 	if err != nil {
 		return err
 	}
-
-	volume := rstr.VolSpec.PoolName + "/" + rstr.Spec.VolumeName
 
 	// nc <host> <port> | zfs recv ...
 	ncCmd := exec.Command(NetCatCmd, ncArgs...)

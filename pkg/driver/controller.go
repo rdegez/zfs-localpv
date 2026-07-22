@@ -250,6 +250,79 @@ func CreateZFSVolume(ctx context.Context, req *csi.CreateVolumeRequest) (string,
 	shared := parameters["shared"]
 	quotatype := parameters["quotatype"]
 
+	// Encryption key source resolution: the per-PVC Secret named by the
+	// encryption-secret annotation on the PVC. It REQUIRES the StorageClass to
+	// also request encryption via the `encryption` parameter — otherwise we would
+	// silently create a plaintext volume, so we fail closed. Requires
+	// --extra-create-metadata on the external-provisioner (enabled) to learn the
+	// PVC name/namespace.
+	var encKeySecretName, encKeySecretNamespace string
+	{
+		encryptionRequested := len(encr) != 0
+
+		pvcName := parameters["csi.storage.k8s.io/pvc/name"]
+		pvcNamespace := parameters["csi.storage.k8s.io/pvc/namespace"]
+		var pvcSecretName string
+		var pvcReadErr error
+		if pvcName != "" && pvcNamespace != "" {
+			pvc, perr := zfs.GetPVC(pvcNamespace, pvcName)
+			if perr != nil {
+				pvcReadErr = perr
+			} else {
+				pvcSecretName = pvc.Annotations[zfs.PVCEncryptionSecretAnnotation]
+			}
+		}
+
+		// Fail closed: never provision an unencrypted volume when a key source
+		// was explicitly requested.
+		if !encryptionRequested && pvcSecretName != "" {
+			return "", status.Errorf(codes.InvalidArgument,
+				"an encryption key source was requested (encryption-secret annotation) "+
+					"but the StorageClass does not set the 'encryption' parameter; "+
+					"refusing to create an unencrypted volume")
+		}
+
+		if encryptionRequested {
+			// If the PVC could not be read, the annotation is the only key source
+			// we could have and we must not guess (risking a plaintext volume) —
+			// fail rather than proceed.
+			if pvcReadErr != nil {
+				return "", status.Errorf(codes.Internal,
+					"failed to get pvc %s/%s for encryption: %s", pvcNamespace, pvcName, pvcReadErr.Error())
+			}
+			if pvcSecretName != "" {
+				// Fail fast if the referenced key is missing or malformed, rather
+				// than deferring the failure to the node.
+				if err := zfs.ValidateEncryptionSecret(pvcSecretName, pvcNamespace); err != nil {
+					return "", status.Errorf(codes.InvalidArgument,
+						"encryption key secret referenced by pvc %s/%s is invalid: %s",
+						pvcNamespace, pvcName, err.Error())
+				}
+				encKeySecretName = pvcSecretName
+				encKeySecretNamespace = pvcNamespace
+				kf = "hex" // managed keys are supplied to ZFS as raw hex (32 bytes)
+			}
+
+			// Encryption was requested but nothing resolved to a key source: no
+			// managed source (annotation) and no legacy keylocation. Fail fast here
+			// rather than let `zfs create` fail cryptically on the node (e.g.
+			// "keyformat must be specified").
+			if encKeySecretName == "" && kl == "" {
+				return "", status.Errorf(codes.InvalidArgument,
+					"encryption is requested but no key source resolved: set the %q PVC "+
+						"annotation, or a legacy keylocation+keyformat on the StorageClass",
+					zfs.PVCEncryptionSecretAnnotation)
+			}
+		}
+	}
+
+	// Managed encryption keys use keylocation=prompt (key fed on stdin); don't
+	// persist a legacy keylocation on the CR, where it would be unused and
+	// misleading (the create-arg builders ignore it in managed mode).
+	if encKeySecretName != "" {
+		kl = ""
+	}
+
 	vtype := zfs.GetVolumeType(fstype)
 
 	capacity := strconv.FormatInt(int64(size), 10)
@@ -303,6 +376,7 @@ func CreateZFSVolume(ctx context.Context, req *csi.CreateVolumeRequest) (string,
 		WithEncryption(encr).
 		WithKeyFormat(kf).
 		WithKeyLocation(kl).
+		WithEncryptionKeySecret(encKeySecretName, encKeySecretNamespace).
 		WithThinProv(tp).
 		WithVolumeType(vtype).
 		WithVolumeStatus(zfs.ZFSStatusPending).
@@ -503,6 +577,22 @@ func (cs *controller) CreateVolume(
 
 	topology := map[string]string{zfs.ZFSTopologyKey: selectedNodeID}
 	cntx := map[string]string{zfs.PoolNameKey: pool, zfs.OpenEBSCasTypeKey: zfs.ZFSCasTypeName}
+
+	// Surface encryption on the PV: this context becomes the PV's
+	// spec.csi.volumeAttributes, so `kubectl get pv` shows whether the volume is
+	// encrypted without inspecting the ZFSVolume CR. It is read back from the CR
+	// (the source of truth), so it covers any encrypted volume regardless of how
+	// the key is supplied. Boolean marker only — the key material is never exposed.
+	if vol, verr := zfs.GetZFSVolume(volName); verr == nil {
+		if vol.Spec.Encryption != "" {
+			cntx[zfs.OpenEBSEncryptedKey] = "true"
+		}
+	} else {
+		// Cosmetic attribute only (encryption is authoritative on the CR); omit
+		// it rather than fail the create if the CR read flakes.
+		klog.V(4).Infof("zfs: could not read ZFSVolume %s to set the %s PV attribute: %s",
+			volName, zfs.OpenEBSEncryptedKey, verr.Error())
+	}
 
 	return csipayload.NewCreateVolumeResponseBuilder().
 		WithName(volName).

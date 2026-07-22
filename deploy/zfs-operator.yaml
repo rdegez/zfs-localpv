@@ -1450,6 +1450,24 @@ spec:
                   Default Value: off.
                 pattern: ^(on|off|aes-128-[c,g]cm|aes-192-[c,g]cm|aes-256-[c,g]cm)$
                 type: string
+              encryptionKeyRef:
+                description: |-
+                  EncryptionKeyRef references the Kubernetes Secret that holds the per-volume
+                  encryption key. The node agent reads it to create and to load-key the
+                  volume. The key material itself is never stored in this CR.
+                properties:
+                  name:
+                    description: Name is the name of the Secret.
+                    minLength: 1
+                    type: string
+                  namespace:
+                    description: |-
+                      Namespace is the namespace of the Secret. It defaults to the namespace of
+                      the requesting PVC.
+                    type: string
+                required:
+                - name
+                type: object
               fsType:
                 description: |-
                   FsType specifies filesystem type for the zfs volume/dataset.
@@ -1684,6 +1702,24 @@ spec:
                   Default Value: off.
                 pattern: ^(on|off|aes-128-[c,g]cm|aes-192-[c,g]cm|aes-256-[c,g]cm)$
                 type: string
+              encryptionKeyRef:
+                description: |-
+                  EncryptionKeyRef references the Kubernetes Secret that holds the per-volume
+                  encryption key. The node agent reads it to create and to load-key the
+                  volume. The key material itself is never stored in this CR.
+                properties:
+                  name:
+                    description: Name is the name of the Secret.
+                    minLength: 1
+                    type: string
+                  namespace:
+                    description: |-
+                      Namespace is the namespace of the Secret. It defaults to the namespace of
+                      the requesting PVC.
+                    type: string
+                required:
+                - name
+                type: object
               fsType:
                 description: |-
                   FsType specifies filesystem type for the zfs volume/dataset.
@@ -1893,6 +1929,24 @@ spec:
                   Default Value: off.
                 pattern: ^(on|off|aes-128-[c,g]cm|aes-192-[c,g]cm|aes-256-[c,g]cm)$
                 type: string
+              encryptionKeyRef:
+                description: |-
+                  EncryptionKeyRef references the Kubernetes Secret that holds the per-volume
+                  encryption key. The node agent reads it to create and to load-key the
+                  volume. The key material itself is never stored in this CR.
+                properties:
+                  name:
+                    description: Name is the name of the Secret.
+                    minLength: 1
+                    type: string
+                  namespace:
+                    description: |-
+                      Namespace is the namespace of the Secret. It defaults to the namespace of
+                      the requesting PVC.
+                    type: string
+                required:
+                - name
+                type: object
               fsType:
                 description: |-
                   FsType specifies filesystem type for the zfs volume/dataset.
@@ -2130,6 +2184,24 @@ spec:
                   Default Value: off.
                 pattern: ^(on|off|aes-128-[c,g]cm|aes-192-[c,g]cm|aes-256-[c,g]cm)$
                 type: string
+              encryptionKeyRef:
+                description: |-
+                  EncryptionKeyRef references the Kubernetes Secret that holds the per-volume
+                  encryption key. The node agent reads it to create and to load-key the
+                  volume. The key material itself is never stored in this CR.
+                properties:
+                  name:
+                    description: Name is the name of the Secret.
+                    minLength: 1
+                    type: string
+                  namespace:
+                    description: |-
+                      Namespace is the namespace of the Secret. It defaults to the namespace of
+                      the requesting PVC.
+                    type: string
+                required:
+                - name
+                type: object
               fsType:
                 description: |-
                   FsType specifies filesystem type for the zfs volume/dataset.
@@ -2373,6 +2445,24 @@ spec:
                   Default Value: off.
                 pattern: ^(on|off|aes-128-[c,g]cm|aes-192-[c,g]cm|aes-256-[c,g]cm)$
                 type: string
+              encryptionKeyRef:
+                description: |-
+                  EncryptionKeyRef references the Kubernetes Secret that holds the per-volume
+                  encryption key. The node agent reads it to create and to load-key the
+                  volume. The key material itself is never stored in this CR.
+                properties:
+                  name:
+                    description: Name is the name of the Secret.
+                    minLength: 1
+                    type: string
+                  namespace:
+                    description: |-
+                      Namespace is the namespace of the Secret. It defaults to the namespace of
+                      the requesting PVC.
+                    type: string
+                required:
+                - name
+                type: object
               fsType:
                 description: |-
                   FsType specifies filesystem type for the zfs volume/dataset.
@@ -2603,6 +2693,12 @@ rules:
   - apiGroups: ["*"]
     resources: ["zfsvolumes", "zfssnapshots", "zfsbackups", "zfsrestores", "zfsnodes"]
     verbs: ["get", "list", "watch", "create", "update", "patch"]
+  # Read the per-volume encryption key referenced by a PVC. Only "get" (not
+  # "list") is granted to limit blast radius, but this is still cluster-wide as
+  # the referenced Secret can live in any PVC namespace.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
 ---
 # Source: zfs-localpv/templates/rbac.yaml
 kind: ClusterRoleBinding
