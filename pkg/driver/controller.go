@@ -720,10 +720,10 @@ func (cs *controller) DeleteVolume(
 
 	// Delete the corresponding ZV CR only if there are no snapshots present for the volume
 	if len(snapList.Items) == 0 {
-		// zfs.DeleteVolume also removes any managed encryption key material
-		// (KMS key / driver-managed auto Secret) after the CR is deleted; this
-		// runs on all destroy paths, so it is not repeated at the other call sites.
-		err = zfs.DeleteVolume(volumeID)
+		// Real deletion: also remove the KMS-stored key after the CR is gone.
+		// (The create-rollback path uses zfs.DeleteVolume, which keeps the key so
+		// a retried CreateVolume can reuse it.)
+		err = zfs.DeleteVolumeAndKey(volumeID)
 		if err != nil {
 			return nil, errors.Wrapf(
 				err,
@@ -1080,7 +1080,8 @@ func (cs *controller) DeleteSnapshot(
 	// Delete the corresponding ZV CR only if this is the last snapshot
 	// for the volume and the corresponding pvc is deleted
 	if len(snapList.Items) == 1 && eligibleForDeletion {
-		err = zfs.DeleteVolume(volumeID)
+		// Real deletion (last snapshot gone, PVC deleted): remove the KMS key too.
+		err = zfs.DeleteVolumeAndKey(volumeID)
 		if err != nil {
 			return nil, errors.Wrapf(
 				err,

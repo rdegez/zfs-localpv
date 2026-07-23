@@ -236,26 +236,32 @@ func DeleteSnapshot(snapname string) (err error) {
 
 // DeleteVolume deletes the corresponding ZFSVol CR
 func DeleteVolume(volumeID string) (err error) {
-	// Capture the key source before the CR is removed (needed for cleanup below).
-	vol, gerr := GetZFSVolume(volumeID)
-
 	err = volbuilder.NewKubeclient().WithNamespace(OpenEBSNamespace).Delete(volumeID)
-	if err != nil {
+	if err == nil {
+		klog.Infof("zfs: deleted the volume %s", volumeID)
+	} else {
 		klog.Infof("zfs: volume %s deletion failed %s", volumeID, err.Error())
-		return
-	}
-	klog.Infof("zfs: deleted the volume %s", volumeID)
-
-	// Best-effort removal of the KMS-stored key AFTER the CR is deleted, so a slow
-	// or unreachable KMS never gates CR deletion, and we never remove the key of a
-	// volume whose CR delete failed. Runs on every destroy path (immediate delete,
-	// delete after the last snapshot, and create rollback). zfs destroy does not
-	// require the key to be loaded, so ordering is safe.
-	if gerr == nil {
-		CleanupEncryptionKey(vol)
 	}
 
 	return
+}
+
+// DeleteVolumeAndKey deletes the ZFSVolume CR and then best-effort removes any
+// managed encryption key material held in a KMS (Vault). Use it for a real
+// volume deletion; do NOT use it on a create rollback, where the key must be
+// kept so the retried CreateVolume reuses it instead of minting a new one.
+// The key is removed AFTER the CR delete (a slow/unreachable KMS never gates CR
+// deletion) and only when the CR delete succeeds; zfs destroy does not require
+// the key to be loaded, so the ordering is safe.
+func DeleteVolumeAndKey(volumeID string) error {
+	vol, gerr := GetZFSVolume(volumeID)
+	if err := DeleteVolume(volumeID); err != nil {
+		return err
+	}
+	if gerr == nil {
+		CleanupEncryptionKey(vol)
+	}
+	return nil
 }
 
 // GetVolList fetches the current Published Volume list
