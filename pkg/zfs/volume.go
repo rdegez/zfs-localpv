@@ -260,6 +260,11 @@ func DeleteVolumeAndKey(volumeID string) error {
 	}
 	if gerr == nil {
 		CleanupEncryptionKey(vol)
+	} else {
+		// The CR is gone but we could not read it first, so we do not know the key
+		// source and cannot clean it. Surface it: a KMS/auto-Secret key may be left
+		// behind for this volume.
+		klog.Warningf("zfs: deleted volume %s but could not read its CR to clean up encryption key material: %v", volumeID, gerr)
 	}
 	return nil
 }

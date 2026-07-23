@@ -101,7 +101,9 @@ volume is deleted.
 
 Define the backend in a ConfigMap `openebs-zfs-kms-config` in the driver
 namespace (keyed by a KMS id). The section is selected from the StorageClass
-with `encryptionKMSID`.
+with `encryptionKMSID`. The KMS id is a ConfigMap data key, so it must match
+`[-._a-zA-Z0-9]+` (letters, digits, `-`, `_`, `.`); e.g. `okms-prod`, not
+`okms/prod`.
 
 ```yaml
 apiVersion: v1
@@ -396,6 +398,13 @@ from a release without this feature is therefore backward-compatible:
   the volume's own name/Secret reference. Restoring an encrypted volume under a
   *different* name (e.g. some Velero flows) will not find the original key —
   restore preserving the volume name, or pre-provision the key under the new name.
+- **Orphaned KMS key on a never-provisioned volume**: the driver generates and
+  stores the KMS key *before* provisioning, and a create rollback deliberately
+  keeps it so `external-provisioner`'s retry (same volume name) reuses it. If a
+  PVC is deleted before any PV ever binds — provisioning kept failing — no CSI
+  `DeleteVolume` runs, so that key is left in the KMS. It is inert (its volume
+  never existed) and there is no automatic reaper; remove such keys out-of-band
+  if you need to. This applies only to the KMS (Mode 2) backend.
 
 The legacy `keylocation`-file StorageClass encryption continues to work unchanged
 alongside per-volume keys.

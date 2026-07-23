@@ -88,10 +88,19 @@ const (
 	// as a provisioning error and churning through the CSI retry loop, request()
 	// backs off in-process (honoring Retry-After when present) and paces the burst
 	// out. Bounded so a persistently overloaded backend still fails eventually
-	// rather than hanging, and always cut short by the caller's context deadline.
+	// rather than hanging; per-operation callers (FetchKey/GetOrCreateKey/
+	// RemoveKey) also cut it short via their context, while auth logins use a
+	// standalone authRetryBudget (they run before any operation context exists).
 	vaultRetryMaxAttempts = 8
 	vaultRetryBase        = 500 * time.Millisecond
 	vaultRetryMax         = 8 * time.Second
+
+	// authRetryBudget bounds the total time an auth login (cert / kubernetes)
+	// spends retrying a rate-limited endpoint. Auth happens while building the
+	// client, before any per-operation context exists, so it cannot ride the CSI
+	// CreateVolume deadline; this standalone budget keeps a throttled auth
+	// endpoint from stalling a provision for the full attempt budget instead.
+	authRetryBudget = 30 * time.Second
 
 	// tlsCertKey / tlsKeyKey are the data keys of a kubernetes.io/tls Secret.
 	tlsCertKey = "tls.crt"
@@ -215,7 +224,9 @@ func (k *vaultKMS) certLogin(cfg map[string]interface{}) (string, error) {
 	if role := cfgString(cfg, cfgVaultRole, ""); role != "" {
 		body["name"] = role
 	}
-	code, respBody, err := k.request(context.Background(), http.MethodPost, path, body)
+	ctx, cancel := context.WithTimeout(context.Background(), authRetryBudget)
+	defer cancel()
+	code, respBody, err := k.request(ctx, http.MethodPost, path, body)
 	if err != nil {
 		return "", err
 	}
@@ -319,7 +330,9 @@ func (k *vaultKMS) kubernetesLogin(cfg map[string]interface{}) (string, error) {
 	authPath := cfgString(cfg, cfgVaultAuthPath, vaultAuthKubernetes)
 	path := fmt.Sprintf("/v1/auth/%s/login", strings.Trim(authPath, "/"))
 
-	code, body, err := k.request(context.Background(), http.MethodPost, path, map[string]interface{}{
+	ctx, cancel := context.WithTimeout(context.Background(), authRetryBudget)
+	defer cancel()
+	code, body, err := k.request(ctx, http.MethodPost, path, map[string]interface{}{
 		"role": role,
 		"jwt":  strings.TrimSpace(string(jwt)),
 	})
@@ -402,6 +415,12 @@ func (k *vaultKMS) request(ctx context.Context, method, path string, body interf
 		// Back off and retry on rate-limit / transient-unavailable responses. Once
 		// the attempt budget is spent, return the last response so the caller
 		// surfaces the backend's own error rather than looping forever.
+		//
+		// Retrying is safe for every method we issue: a KV v2 data write (POST)
+		// that actually committed before a 503 just adds another version with the
+		// same key value, which GetOrCreateKey's read-back then confirms; the
+		// metadata DELETE is idempotent (a 404 is accepted); and an auth login
+		// re-issued after a lost response only mints a fresh (short-lived) token.
 		if (resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusServiceUnavailable) &&
 			attempt < vaultRetryMaxAttempts {
 			wait := retryAfter(resp.Header, attempt)

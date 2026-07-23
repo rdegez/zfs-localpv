@@ -483,7 +483,14 @@ func CreateZFSVolume(ctx context.Context, req *csi.CreateVolumeRequest) (string,
 	}
 
 	if err != nil {
-		// volume provisioning failed, delete the zfs volume resource
+		// Volume provisioning failed: delete the ZFSVolume CR but KEEP any managed
+		// encryption key (DeleteVolume, not DeleteVolumeAndKey). external-provisioner
+		// retries CreateVolume with the same volume name, and the retry must reuse
+		// the same key (re-minting one would fail to unlock a dataset a node may have
+		// already created, and would re-poison an eventually-consistent KMS's
+		// negative cache). Trade-off: if the PVC is deleted before any PV binds, no
+		// DeleteVolume RPC ever runs, so the key is orphaned in the KMS (documented
+		// in docs/encryption.md, "Limitations").
 		zfs.DeleteVolume(volName) // ignore error
 	}
 

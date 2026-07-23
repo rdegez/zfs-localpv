@@ -1,4 +1,4 @@
-{{- if .Values.kms.configs }}
+{{- if (.Values.kms | default dict).configs }}
 kind: ConfigMap
 apiVersion: v1
 metadata:

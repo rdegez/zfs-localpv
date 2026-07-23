@@ -354,9 +354,11 @@ func TestVaultKMS_RetriesOn429(t *testing.T) {
 	}
 }
 
-// TestVaultKMS_429ExhaustsBudget verifies that a backend that never stops
-// throttling eventually surfaces the 429 rather than looping forever.
-func TestVaultKMS_429ExhaustsBudget(t *testing.T) {
+// TestVaultKMS_429ContextCancels verifies that a backend that never stops
+// throttling does not loop forever: the caller's context deadline cuts the
+// backoff short and surfaces an error. (The independent 8-attempt budget is the
+// other bound; here the 2s context trips first.)
+func TestVaultKMS_429ContextCancels(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Retry-After", "1")
 		w.WriteHeader(http.StatusTooManyRequests)
