@@ -17,6 +17,10 @@ rules:
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["get", "list"]
+  # Read the KMS backend configuration (openebs-zfs-kms-config) for encryption.
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get"]
   - apiGroups: [""]
     resources: ["namespaces"]
     verbs: ["*"]
@@ -189,6 +193,10 @@ rules:
   # the referenced Secret can live in any PVC namespace.
   - apiGroups: [""]
     resources: ["secrets"]
+    verbs: ["get"]
+  # Read the KMS backend configuration (openebs-zfs-kms-config) for encryption.
+  - apiGroups: [""]
+    resources: ["configmaps"]
     verbs: ["get"]
 ---
 kind: ClusterRoleBinding

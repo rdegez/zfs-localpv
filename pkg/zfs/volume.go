@@ -236,11 +236,23 @@ func DeleteSnapshot(snapname string) (err error) {
 
 // DeleteVolume deletes the corresponding ZFSVol CR
 func DeleteVolume(volumeID string) (err error) {
+	// Capture the key source before the CR is removed (needed for cleanup below).
+	vol, gerr := GetZFSVolume(volumeID)
+
 	err = volbuilder.NewKubeclient().WithNamespace(OpenEBSNamespace).Delete(volumeID)
-	if err == nil {
-		klog.Infof("zfs: deleted the volume %s", volumeID)
-	} else {
+	if err != nil {
 		klog.Infof("zfs: volume %s deletion failed %s", volumeID, err.Error())
+		return
+	}
+	klog.Infof("zfs: deleted the volume %s", volumeID)
+
+	// Best-effort removal of the KMS-stored key AFTER the CR is deleted, so a slow
+	// or unreachable KMS never gates CR deletion, and we never remove the key of a
+	// volume whose CR delete failed. Runs on every destroy path (immediate delete,
+	// delete after the last snapshot, and create rollback). zfs destroy does not
+	// require the key to be loaded, so ordering is safe.
+	if gerr == nil {
+		CleanupEncryptionKey(vol)
 	}
 
 	return

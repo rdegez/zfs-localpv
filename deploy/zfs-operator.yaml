@@ -1450,6 +1450,14 @@ spec:
                   Default Value: off.
                 pattern: ^(on|off|aes-128-[c,g]cm|aes-192-[c,g]cm|aes-256-[c,g]cm)$
                 type: string
+              encryptionKMSID:
+                description: |-
+                  EncryptionKMSID selects the key management backend that holds the
+                  per-volume encryption key. It references a named section of the
+                  openebs-zfs-kms-config ConfigMap. When set, the node agent fetches the
+                  key from that backend (e.g. HashiCorp Vault) instead of using a
+                  keylocation file. Mutually exclusive with EncryptionKeyRef.
+                type: string
               encryptionKeyRef:
                 description: |-
                   EncryptionKeyRef references the Kubernetes Secret that holds the per-volume
@@ -1702,6 +1710,14 @@ spec:
                   Default Value: off.
                 pattern: ^(on|off|aes-128-[c,g]cm|aes-192-[c,g]cm|aes-256-[c,g]cm)$
                 type: string
+              encryptionKMSID:
+                description: |-
+                  EncryptionKMSID selects the key management backend that holds the
+                  per-volume encryption key. It references a named section of the
+                  openebs-zfs-kms-config ConfigMap. When set, the node agent fetches the
+                  key from that backend (e.g. HashiCorp Vault) instead of using a
+                  keylocation file. Mutually exclusive with EncryptionKeyRef.
+                type: string
               encryptionKeyRef:
                 description: |-
                   EncryptionKeyRef references the Kubernetes Secret that holds the per-volume
@@ -1928,6 +1944,14 @@ spec:
                   (though the deduplicated data itself is encrypted).
                   Default Value: off.
                 pattern: ^(on|off|aes-128-[c,g]cm|aes-192-[c,g]cm|aes-256-[c,g]cm)$
+                type: string
+              encryptionKMSID:
+                description: |-
+                  EncryptionKMSID selects the key management backend that holds the
+                  per-volume encryption key. It references a named section of the
+                  openebs-zfs-kms-config ConfigMap. When set, the node agent fetches the
+                  key from that backend (e.g. HashiCorp Vault) instead of using a
+                  keylocation file. Mutually exclusive with EncryptionKeyRef.
                 type: string
               encryptionKeyRef:
                 description: |-
@@ -2183,6 +2207,14 @@ spec:
                   (though the deduplicated data itself is encrypted).
                   Default Value: off.
                 pattern: ^(on|off|aes-128-[c,g]cm|aes-192-[c,g]cm|aes-256-[c,g]cm)$
+                type: string
+              encryptionKMSID:
+                description: |-
+                  EncryptionKMSID selects the key management backend that holds the
+                  per-volume encryption key. It references a named section of the
+                  openebs-zfs-kms-config ConfigMap. When set, the node agent fetches the
+                  key from that backend (e.g. HashiCorp Vault) instead of using a
+                  keylocation file. Mutually exclusive with EncryptionKeyRef.
                 type: string
               encryptionKeyRef:
                 description: |-
@@ -2445,6 +2477,14 @@ spec:
                   Default Value: off.
                 pattern: ^(on|off|aes-128-[c,g]cm|aes-192-[c,g]cm|aes-256-[c,g]cm)$
                 type: string
+              encryptionKMSID:
+                description: |-
+                  EncryptionKMSID selects the key management backend that holds the
+                  per-volume encryption key. It references a named section of the
+                  openebs-zfs-kms-config ConfigMap. When set, the node agent fetches the
+                  key from that backend (e.g. HashiCorp Vault) instead of using a
+                  keylocation file. Mutually exclusive with EncryptionKeyRef.
+                type: string
               encryptionKeyRef:
                 description: |-
                   EncryptionKeyRef references the Kubernetes Secret that holds the per-volume
@@ -2589,6 +2629,10 @@ rules:
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["get", "list"]
+  # Read the KMS backend configuration (openebs-zfs-kms-config) for encryption.
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get"]
   - apiGroups: [""]
     resources: ["namespaces"]
     verbs: ["*"]
@@ -2698,6 +2742,10 @@ rules:
   # the referenced Secret can live in any PVC namespace.
   - apiGroups: [""]
     resources: ["secrets"]
+    verbs: ["get"]
+  # Read the KMS backend configuration (openebs-zfs-kms-config) for encryption.
+  - apiGroups: [""]
+    resources: ["configmaps"]
     verbs: ["get"]
 ---
 # Source: zfs-localpv/templates/rbac.yaml

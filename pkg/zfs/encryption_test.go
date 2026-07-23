@@ -39,6 +39,7 @@ func TestUsesManagedKey(t *testing.T) {
 		want bool
 	}{
 		{"secret ref", apis.VolumeInfo{EncryptionKeyRef: &apis.EncryptionKeyReference{Name: "k"}}, true},
+		{"kms id", apis.VolumeInfo{EncryptionKMSID: "vault"}, true},
 		{"legacy keylocation", apis.VolumeInfo{KeyLocation: "file:///etc/key"}, false},
 		{"none", apis.VolumeInfo{}, false},
 	}

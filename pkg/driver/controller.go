@@ -250,16 +250,18 @@ func CreateZFSVolume(ctx context.Context, req *csi.CreateVolumeRequest) (string,
 	shared := parameters["shared"]
 	quotatype := parameters["quotatype"]
 
-	// Encryption key source resolution. Two opt-in signals, resolved in this
+	// Encryption key source resolution. Three opt-in signals, resolved in this
 	// precedence order:
 	//   1. per-PVC Secret named by the encryption-secret annotation on the PVC,
-	//   2. auto mode (autoCreateEncryptionKey=true): a driver-generated Secret.
-	// Either REQUIRES the StorageClass to also request encryption via the
+	//   2. a KMS backend selected by the encryptionKMSID StorageClass parameter,
+	//   3. auto mode (autoCreateEncryptionKey=true): a driver-generated Secret.
+	// Any of these REQUIRES the StorageClass to also request encryption via the
 	// `encryption` parameter — otherwise we would silently create a plaintext
 	// volume, so we fail closed. Requires --extra-create-metadata on the
 	// external-provisioner (enabled) to learn the PVC name/namespace.
-	var encKeySecretName, encKeySecretNamespace string
+	var encKeySecretName, encKeySecretNamespace, encKMSID string
 	{
+		kmsID := parameters["encryptionkmsid"]
 		autoCreate := false
 		if v := parameters["autocreateencryptionkey"]; v != "" {
 			b, perr := strconv.ParseBool(v)
@@ -278,9 +280,9 @@ func CreateZFSVolume(ctx context.Context, req *csi.CreateVolumeRequest) (string,
 		if pvcName != "" && pvcNamespace != "" {
 			pvc, perr := zfs.GetPVC(pvcNamespace, pvcName)
 			if perr != nil {
-				// Defer: only the annotation path needs the PVC, so a read error is
-				// only fatal when the annotation is the sole possible source (decided
-				// below), not for auto mode.
+				// Defer: only the annotation path needs the PVC, so a read error
+				// is only fatal when the annotation is the sole possible source
+				// (decided below), not for KMS/auto modes.
 				pvcReadErr = perr
 			} else {
 				pvcSecretName = pvc.Annotations[zfs.PVCEncryptionSecretAnnotation]
@@ -289,24 +291,34 @@ func CreateZFSVolume(ctx context.Context, req *csi.CreateVolumeRequest) (string,
 
 		// Fail closed: never provision an unencrypted volume when a key source
 		// was explicitly requested.
-		if !encryptionRequested && (pvcSecretName != "" || autoCreate) {
+		if !encryptionRequested && (pvcSecretName != "" || kmsID != "" || autoCreate) {
 			return "", status.Errorf(codes.InvalidArgument,
-				"an encryption key source was requested (encryption-secret annotation "+
-					"or autoCreateEncryptionKey) but the StorageClass does not set the "+
-					"'encryption' parameter; refusing to create an unencrypted volume")
+				"an encryption key source was requested (encryption-secret annotation, "+
+					"encryptionKMSID, or autoCreateEncryptionKey) but the StorageClass does not "+
+					"set the 'encryption' parameter; refusing to create an unencrypted volume")
 		}
 
 		// Warn (don't fail) if more than one source is set; precedence applies.
-		if pvcSecretName != "" && autoCreate {
-			klog.Warningf("zfs: volume %s has multiple encryption key sources set (annotation and auto); applying precedence Secret > auto",
-				volName)
+		srcs := 0
+		if pvcSecretName != "" {
+			srcs++
+		}
+		if kmsID != "" {
+			srcs++
+		}
+		if autoCreate {
+			srcs++
+		}
+		if srcs > 1 {
+			klog.Warningf("zfs: volume %s has multiple encryption key sources set (annotation=%t kmsID=%t auto=%t); applying precedence Secret > KMS > auto",
+				volName, pvcSecretName != "", kmsID != "", autoCreate)
 		}
 
 		if encryptionRequested {
-			// If the PVC could not be read and there is no auto source, the
-			// annotation is the only key source we could have and we must not guess
-			// (risking a plaintext volume) — fail. Auto mode does not need it.
-			if pvcReadErr != nil && !autoCreate {
+			// If the PVC could not be read and there is no KMS/auto source, the
+			// annotation is the only key source we could have and we must not
+			// guess (risking a plaintext volume) — fail. KMS/auto don't need it.
+			if pvcReadErr != nil && kmsID == "" && !autoCreate {
 				return "", status.Errorf(codes.Internal,
 					"failed to get pvc %s/%s for encryption: %s", pvcNamespace, pvcName, pvcReadErr.Error())
 			}
@@ -322,6 +334,15 @@ func CreateZFSVolume(ctx context.Context, req *csi.CreateVolumeRequest) (string,
 				encKeySecretName = pvcSecretName
 				encKeySecretNamespace = pvcNamespace
 				kf = "hex" // managed keys are supplied to ZFS as raw hex (32 bytes)
+			case kmsID != "":
+				// Generate+store the key now so it is present before the node
+				// agent creates the encrypted dataset.
+				if err := zfs.ProvisionEncryptionKey(kmsID, volName); err != nil {
+					return "", status.Errorf(codes.Internal,
+						"failed to provision encryption key in kms %q: %s", kmsID, err.Error())
+				}
+				encKMSID = kmsID
+				kf = "hex"
 			case autoCreate:
 				sn, sns, err := zfs.ProvisionAutoKeySecret(volName)
 				if err != nil {
@@ -334,13 +355,13 @@ func CreateZFSVolume(ctx context.Context, req *csi.CreateVolumeRequest) (string,
 			}
 
 			// Encryption was requested but nothing resolved to a key source: no
-			// managed source (annotation / auto) and no legacy keylocation. Fail
-			// fast here rather than let `zfs create` fail cryptically on the node
-			// (e.g. "keyformat must be specified").
-			if encKeySecretName == "" && kl == "" {
+			// managed source (annotation / KMS / auto) and no legacy keylocation.
+			// Fail fast here rather than let `zfs create` fail cryptically on the
+			// node (e.g. "keyformat must be specified").
+			if encKeySecretName == "" && encKMSID == "" && kl == "" {
 				return "", status.Errorf(codes.InvalidArgument,
 					"encryption is requested but no key source resolved: set the %q PVC "+
-						"annotation, autoCreateEncryptionKey=\"true\", or a legacy "+
+						"annotation, encryptionKMSID, autoCreateEncryptionKey=\"true\", or a legacy "+
 						"keylocation+keyformat on the StorageClass",
 					zfs.PVCEncryptionSecretAnnotation)
 			}
@@ -350,7 +371,7 @@ func CreateZFSVolume(ctx context.Context, req *csi.CreateVolumeRequest) (string,
 	// Managed encryption keys use keylocation=prompt (key fed on stdin); don't
 	// persist a legacy keylocation on the CR, where it would be unused and
 	// misleading (the create-arg builders ignore it in managed mode).
-	if encKeySecretName != "" {
+	if encKeySecretName != "" || encKMSID != "" {
 		kl = ""
 	}
 
@@ -377,7 +398,7 @@ func CreateZFSVolume(ctx context.Context, req *csi.CreateVolumeRequest) (string,
 			// Idempotent retry of an already-provisioned volume: re-assert the
 			// auto-key Secret's OwnerReference in case the original create set the
 			// key but crashed before binding it (best-effort; no-op once bound or
-			// for user Secrets).
+			// for user Secrets / KMS).
 			if oerr := zfs.SetAutoKeySecretOwner(vol); oerr != nil {
 				klog.Warningf("zfs: could not set owner on auto key secret for %s: %s", volName, oerr.Error())
 			}
@@ -415,6 +436,7 @@ func CreateZFSVolume(ctx context.Context, req *csi.CreateVolumeRequest) (string,
 		WithKeyFormat(kf).
 		WithKeyLocation(kl).
 		WithEncryptionKeySecret(encKeySecretName, encKeySecretNamespace).
+		WithEncryptionKMSID(encKMSID).
 		WithThinProv(tp).
 		WithVolumeType(vtype).
 		WithVolumeStatus(zfs.ZFSStatusPending).
@@ -447,7 +469,7 @@ func CreateZFSVolume(ctx context.Context, req *csi.CreateVolumeRequest) (string,
 		if err == nil {
 			// Bind the driver-managed auto-key Secret to the CR so it is
 			// garbage-collected on any deletion path (best-effort; a no-op for
-			// user Secrets).
+			// user Secrets / KMS).
 			if oerr := zfs.SetAutoKeySecretOwner(vol); oerr != nil {
 				klog.Warningf("zfs: could not set owner on auto key secret for %s: %s", volName, oerr.Error())
 			}
@@ -625,8 +647,8 @@ func (cs *controller) CreateVolume(
 	// Surface encryption on the PV: this context becomes the PV's
 	// spec.csi.volumeAttributes, so `kubectl get pv` shows whether the volume is
 	// encrypted without inspecting the ZFSVolume CR. It is read back from the CR
-	// (the source of truth), so it covers any encrypted volume regardless of how
-	// the key is supplied. Boolean marker only — the key material is never exposed.
+	// (the source of truth), so it covers every mode (Secret / auto / KMS) and
+	// clones/restores. Boolean marker only — the key material is never exposed.
 	if vol, verr := zfs.GetZFSVolume(volName); verr == nil {
 		if vol.Spec.Encryption != "" {
 			cntx[zfs.OpenEBSEncryptedKey] = "true"
@@ -698,6 +720,9 @@ func (cs *controller) DeleteVolume(
 
 	// Delete the corresponding ZV CR only if there are no snapshots present for the volume
 	if len(snapList.Items) == 0 {
+		// zfs.DeleteVolume also removes any managed encryption key material
+		// (KMS key / driver-managed auto Secret) after the CR is deleted; this
+		// runs on all destroy paths, so it is not repeated at the other call sites.
 		err = zfs.DeleteVolume(volumeID)
 		if err != nil {
 			return nil, errors.Wrapf(

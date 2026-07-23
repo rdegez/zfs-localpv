@@ -135,6 +135,12 @@ func (b *Builder) WithEncryptionKeySecret(name, namespace string) *Builder {
 	return b
 }
 
+// WithEncryptionKMSID sets the KMS backend id that holds the per-volume key
+func (b *Builder) WithEncryptionKMSID(id string) *Builder {
+	b.volume.Object.Spec.EncryptionKMSID = id
+	return b
+}
+
 // WithCompression sets compression of ZFSVolume
 func (b *Builder) WithCompression(compression string) *Builder {
 	b.volume.Object.Spec.Compression = compression

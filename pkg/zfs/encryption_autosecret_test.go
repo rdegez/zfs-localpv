@@ -20,6 +20,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/openebs/zfs-localpv/pkg/kms"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
@@ -54,8 +55,8 @@ func TestProvisionAutoKeySecret(t *testing.T) {
 	if len(s.Finalizers) != 0 {
 		t.Errorf("auto key secret must not carry a finalizer, got %v", s.Finalizers)
 	}
-	key := string(s.Data[encryptionSecretKeyField])
-	if err := validateHexKey(key); err != nil {
+	key := string(s.Data[kms.SecretKeyField])
+	if err := kms.ValidateHexKey(key); err != nil {
 		t.Errorf("stored key invalid: %v", err)
 	}
 
@@ -64,8 +65,8 @@ func TestProvisionAutoKeySecret(t *testing.T) {
 		t.Fatalf("second provision: %v", err)
 	}
 	s2, _ := client.CoreV1().Secrets(ns).Get(context.Background(), name, metav1.GetOptions{})
-	if string(s2.Data[encryptionSecretKeyField]) != key {
-		t.Errorf("key changed on retry: %q -> %q", key, string(s2.Data[encryptionSecretKeyField]))
+	if string(s2.Data[kms.SecretKeyField]) != key {
+		t.Errorf("key changed on retry: %q -> %q", key, string(s2.Data[kms.SecretKeyField]))
 	}
 }
 
@@ -79,7 +80,7 @@ func TestProvisionAutoKeySecret_RefusesUnmanaged(t *testing.T) {
 			Name:      AutoKeySecretPrefix + vol,
 			Namespace: ns,
 		},
-		Data: map[string][]byte{encryptionSecretKeyField: []byte("not-ours")},
+		Data: map[string][]byte{kms.SecretKeyField: []byte("not-ours")},
 	})
 	if _, _, err := provisionAutoKeySecret(client, ns, vol); err == nil {
 		t.Error("expected refusal to adopt an unlabelled pre-existing secret, got nil")

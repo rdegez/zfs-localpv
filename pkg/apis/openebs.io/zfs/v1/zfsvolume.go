@@ -178,6 +178,13 @@ type VolumeInfo struct {
 	// volume. The key material itself is never stored in this CR.
 	EncryptionKeyRef *EncryptionKeyReference `json:"encryptionKeyRef,omitempty"`
 
+	// EncryptionKMSID selects the key management backend that holds the
+	// per-volume encryption key. It references a named section of the
+	// openebs-zfs-kms-config ConfigMap. When set, the node agent fetches the
+	// key from that backend (e.g. HashiCorp Vault) instead of using a
+	// keylocation file. Mutually exclusive with EncryptionKeyRef.
+	EncryptionKMSID string `json:"encryptionKMSID,omitempty"`
+
 	// ThinProvision describes whether space reservation for the source volume is required or not.
 	// The value "yes" indicates that volume should be thin provisioned and "no" means thick provisioning of the volume.
 	// If thinProvision is set to "yes" then volume can be provisioned even if the ZPOOL does not
