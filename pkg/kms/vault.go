@@ -25,8 +25,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -79,6 +81,17 @@ const (
 	// key when it creates the dataset.
 	writeReadbackTimeout  = 30 * time.Second
 	writeReadbackInterval = 500 * time.Millisecond
+
+	// Retry bounds for rate-limited / transiently-unavailable backends. A burst
+	// of concurrent CreateVolume calls can make the KV backend (or a proxy in
+	// front of it) answer 429 Too Many Requests or 503; instead of surfacing that
+	// as a provisioning error and churning through the CSI retry loop, request()
+	// backs off in-process (honoring Retry-After when present) and paces the burst
+	// out. Bounded so a persistently overloaded backend still fails eventually
+	// rather than hanging, and always cut short by the caller's context deadline.
+	vaultRetryMaxAttempts = 8
+	vaultRetryBase        = 500 * time.Millisecond
+	vaultRetryMax         = 8 * time.Second
 
 	// tlsCertKey / tlsKeyKey are the data keys of a kubernetes.io/tls Secret.
 	tlsCertKey = "tls.crt"
@@ -202,7 +215,7 @@ func (k *vaultKMS) certLogin(cfg map[string]interface{}) (string, error) {
 	if role := cfgString(cfg, cfgVaultRole, ""); role != "" {
 		body["name"] = role
 	}
-	code, respBody, err := k.request(http.MethodPost, path, body)
+	code, respBody, err := k.request(context.Background(), http.MethodPost, path, body)
 	if err != nil {
 		return "", err
 	}
@@ -306,7 +319,7 @@ func (k *vaultKMS) kubernetesLogin(cfg map[string]interface{}) (string, error) {
 	authPath := cfgString(cfg, cfgVaultAuthPath, vaultAuthKubernetes)
 	path := fmt.Sprintf("/v1/auth/%s/login", strings.Trim(authPath, "/"))
 
-	code, body, err := k.request(http.MethodPost, path, map[string]interface{}{
+	code, body, err := k.request(context.Background(), http.MethodPost, path, map[string]interface{}{
 		"role": role,
 		"jwt":  strings.TrimSpace(string(jwt)),
 	})
@@ -348,42 +361,88 @@ func (k *vaultKMS) kvPath(kind, volumeID string) string {
 	return "/" + strings.Join(segs, "/")
 }
 
-func (k *vaultKMS) request(method, path string, body interface{}) (int, []byte, error) {
-	var reader io.Reader
+func (k *vaultKMS) request(ctx context.Context, method, path string, body interface{}) (int, []byte, error) {
+	var payload []byte
 	if body != nil {
 		b, err := json.Marshal(body)
 		if err != nil {
 			return 0, nil, err
 		}
-		reader = bytes.NewReader(b)
+		payload = b
 	}
-	req, err := http.NewRequest(method, k.addr+path, reader)
-	if err != nil {
-		return 0, nil, err
+
+	for attempt := 0; ; attempt++ {
+		var reader io.Reader
+		if payload != nil {
+			reader = bytes.NewReader(payload)
+		}
+		req, err := http.NewRequestWithContext(ctx, method, k.addr+path, reader)
+		if err != nil {
+			return 0, nil, err
+		}
+		if k.token != "" {
+			req.Header.Set("X-Vault-Token", k.token)
+		}
+		if k.namespace != "" {
+			req.Header.Set("X-Vault-Namespace", k.namespace)
+		}
+		if payload != nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		resp, err := k.httpc.Do(req)
+		if err != nil {
+			return 0, nil, fmt.Errorf("kms(%s): %s %s: %w", ProviderVault, method, path, err)
+		}
+		data, rerr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if rerr != nil {
+			return resp.StatusCode, nil, rerr
+		}
+
+		// Back off and retry on rate-limit / transient-unavailable responses. Once
+		// the attempt budget is spent, return the last response so the caller
+		// surfaces the backend's own error rather than looping forever.
+		if (resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusServiceUnavailable) &&
+			attempt < vaultRetryMaxAttempts {
+			wait := retryAfter(resp.Header, attempt)
+			klog.V(4).Infof("kms(%s): %s %s got %d, backing off %s (attempt %d/%d)",
+				ProviderVault, method, path, resp.StatusCode, wait, attempt+1, vaultRetryMaxAttempts)
+			select {
+			case <-ctx.Done():
+				return 0, nil, ctx.Err()
+			case <-time.After(wait):
+			}
+			continue
+		}
+		return resp.StatusCode, data, nil
 	}
-	if k.token != "" {
-		req.Header.Set("X-Vault-Token", k.token)
+}
+
+// retryAfter returns how long to wait before the next attempt. It honors a
+// numeric Retry-After header when the backend sends one (capped so an absurd
+// value can't stall provisioning), otherwise it uses capped exponential backoff
+// with equal jitter to avoid a thundering herd of concurrent CreateVolume calls
+// all retrying in lockstep.
+func retryAfter(h http.Header, attempt int) time.Duration {
+	if v := h.Get("Retry-After"); v != "" {
+		if secs, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && secs > 0 {
+			d := time.Duration(secs) * time.Second
+			if max := 4 * vaultRetryMax; d > max {
+				d = max
+			}
+			return d
+		}
 	}
-	if k.namespace != "" {
-		req.Header.Set("X-Vault-Namespace", k.namespace)
+	backoff := vaultRetryBase << attempt
+	if backoff > vaultRetryMax {
+		backoff = vaultRetryMax
 	}
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	resp, err := k.httpc.Do(req)
-	if err != nil {
-		return 0, nil, fmt.Errorf("kms(%s): %s %s: %w", ProviderVault, method, path, err)
-	}
-	defer resp.Body.Close()
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return resp.StatusCode, nil, err
-	}
-	return resp.StatusCode, data, nil
+	half := backoff / 2
+	return half + time.Duration(rand.Int63n(int64(half)+1))
 }
 
 func (k *vaultKMS) FetchKey(ctx context.Context, volumeID string) (string, error) {
-	code, body, err := k.request(http.MethodGet, k.dataPath(volumeID), nil)
+	code, body, err := k.request(ctx, http.MethodGet, k.dataPath(volumeID), nil)
 	if err != nil {
 		return "", err
 	}
@@ -424,7 +483,7 @@ func (k *vaultKMS) GetOrCreateKey(ctx context.Context, volumeID string) (string,
 	payload := map[string]interface{}{
 		"data": map[string]string{vaultDataKey: key},
 	}
-	code, body, err := k.request(http.MethodPost, k.dataPath(volumeID), payload)
+	code, body, err := k.request(ctx, http.MethodPost, k.dataPath(volumeID), payload)
 	if err != nil {
 		return "", err
 	}
@@ -459,7 +518,7 @@ func (k *vaultKMS) GetOrCreateKey(ctx context.Context, volumeID string) (string,
 
 func (k *vaultKMS) RemoveKey(ctx context.Context, volumeID string) error {
 	// Delete the metadata path to remove all versions (KV v2).
-	code, body, err := k.request(http.MethodDelete, k.metaPath(volumeID), nil)
+	code, body, err := k.request(ctx, http.MethodDelete, k.metaPath(volumeID), nil)
 	if err != nil {
 		return err
 	}

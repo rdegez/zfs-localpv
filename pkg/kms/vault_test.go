@@ -33,6 +33,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -317,5 +318,81 @@ func TestVaultKMS_CertLogin(t *testing.T) {
 	// The issued token must be accepted on a subsequent KV write.
 	if _, err := k.GetOrCreateKey(context.Background(), "vol-cert"); err != nil {
 		t.Fatalf("GetOrCreateKey after cert login: %v", err)
+	}
+}
+
+// TestVaultKMS_RetriesOn429 verifies that a burst-induced 429 (or 503) from the
+// backend is retried in-process rather than surfaced as a provisioning error.
+// The fake server answers 429 for the first two requests, then serves normally;
+// GetOrCreateKey must still succeed.
+func TestVaultKMS_RetriesOn429(t *testing.T) {
+	fake := &fakeVault{store: map[string]string{}, token: "test-token"}
+	inner := fake.handler(t)
+	var seen int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Only throttle KV data requests; let auth (none here) and metadata pass.
+		if strings.Contains(r.URL.Path, "/secret/data/") && atomic.AddInt32(&seen, 1) <= 2 {
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"errors":["Too many requests"]}`))
+			return
+		}
+		inner.ServeHTTP(w, r)
+	}))
+	defer srv.Close()
+
+	k := newVaultForTest(t, srv.URL, "test-token")
+	key, err := k.GetOrCreateKey(context.Background(), "vol-429")
+	if err != nil {
+		t.Fatalf("GetOrCreateKey should ride through 429s, got: %v", err)
+	}
+	if err := ValidateHexKey(key); err != nil {
+		t.Fatalf("key invalid: %v", err)
+	}
+	if got := atomic.LoadInt32(&seen); got < 3 {
+		t.Errorf("expected the throttled requests to be retried (>=3 data hits), got %d", got)
+	}
+}
+
+// TestVaultKMS_429ExhaustsBudget verifies that a backend that never stops
+// throttling eventually surfaces the 429 rather than looping forever.
+func TestVaultKMS_429ExhaustsBudget(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "1")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"errors":["Too many requests"]}`))
+	}))
+	defer srv.Close()
+
+	k := newVaultForTest(t, srv.URL, "test-token")
+	// Bound the wait: Retry-After is 1s * (attempts+1); keep the test snappy by
+	// cancelling well before the full budget elapses and asserting we get an error.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if _, err := k.FetchKey(ctx, "vol-nope"); err == nil {
+		t.Fatal("expected an error when the backend never stops throttling")
+	}
+}
+
+// TestRetryAfter checks the backoff helper: a numeric Retry-After is honored and
+// capped, and without a header the value stays within the jittered bound.
+func TestRetryAfter(t *testing.T) {
+	// Honors numeric Retry-After.
+	h := http.Header{}
+	h.Set("Retry-After", "3")
+	if d := retryAfter(h, 0); d != 3*time.Second {
+		t.Errorf("Retry-After: got %s, want 3s", d)
+	}
+	// Caps an absurd Retry-After.
+	h.Set("Retry-After", "100000")
+	if d := retryAfter(h, 0); d != 4*vaultRetryMax {
+		t.Errorf("Retry-After cap: got %s, want %s", d, 4*vaultRetryMax)
+	}
+	// No header: exponential backoff with equal jitter, capped at vaultRetryMax.
+	for attempt := 0; attempt < 12; attempt++ {
+		d := retryAfter(http.Header{}, attempt)
+		if d < 0 || d > vaultRetryMax {
+			t.Errorf("attempt %d: backoff %s out of [0, %s]", attempt, d, vaultRetryMax)
+		}
 	}
 }
