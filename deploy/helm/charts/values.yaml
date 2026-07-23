@@ -193,6 +193,36 @@ zfs:
   # bin: /run/current-system/sw/bin/zfs
   bin: zfs
 
+# KMS backends for per-volume encryption keys (Mode 2). When 'configs' is
+# non-empty the chart renders the openebs-zfs-kms-config ConfigMap in the
+# release namespace; each entry is one backend keyed by its kmsID (the value a
+# StorageClass references via the 'encryptionKMSID' parameter). The driver
+# re-reads this ConfigMap on every key operation, so a helm upgrade that changes
+# it takes effect without restarting the driver.
+#
+# Only non-sensitive settings belong here. Auth material (Vault tokens, mTLS
+# client cert/key) must live in Secrets in the release namespace, referenced by
+# name (vaultTokenSecretName / vaultClientCertSecretName); never put it in
+# values (it would leak via `helm get values`, release history in etcd, and any
+# committed values file).
+kms:
+  configs: {}
+  #  okms-prod:
+  #    provider: vault
+  #    vaultAuthMethod: mtls
+  #    vaultAddress: https://eu-west-rbx.okms.ovh.net/api/<domain-id>
+  #    vaultClientCertSecretName: okms-client-cert   # kubernetes.io/tls Secret you create
+  #    vaultKeyPrefix: zfs-localpv
+  #    vaultCACert: |
+  #      -----BEGIN CERTIFICATE-----
+  #      ...server CA...
+  #      -----END CERTIFICATE-----
+  #  vault-prod:
+  #    provider: vault
+  #    vaultAuthMethod: token
+  #    vaultAddress: https://vault.example.com:8200
+  #    vaultTokenSecretName: openebs-zfs-vault-token   # generic Secret with key 'token'
+
 crds:
   zfsLocalPv:
     # Install zfs-localpv CRDs

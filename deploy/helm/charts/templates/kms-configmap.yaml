@@ -1,0 +1,14 @@
+{{- if .Values.kms.configs }}
+kind: ConfigMap
+apiVersion: v1
+metadata:
+  name: openebs-zfs-kms-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "zfslocalpv.common.metaLabels" . | nindent 4 }}
+data:
+  {{- range $id, $cfg := .Values.kms.configs }}
+  {{ $id }}: |
+    {{- toJson $cfg | nindent 4 }}
+  {{- end }}
+{{- end }}

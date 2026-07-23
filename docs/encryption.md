@@ -140,6 +140,30 @@ kubectl -n <driver-namespace> create secret generic openebs-zfs-vault-token \
   --from-literal=token="<vault-token>"
 ```
 
+#### Managing the ConfigMap with Helm
+
+Instead of applying the ConfigMap by hand you can let the chart render it from
+`values.yaml`. Each entry under `kms.configs` becomes one section, keyed by its
+kmsID:
+
+```yaml
+kms:
+  configs:
+    vault-prod:
+      provider: vault
+      vaultAuthMethod: token
+      vaultAddress: https://vault.example.com:8200
+      vaultTokenSecretName: openebs-zfs-vault-token
+```
+
+`kms.configs` is empty by default, so the ConfigMap is only rendered when you
+set it — existing installs are unaffected. The driver re-reads the ConfigMap on
+every key operation, so a `helm upgrade` that changes a backend takes effect
+without restarting the driver. Only non-sensitive settings belong in values;
+auth material (tokens, mTLS cert/key) stays in Secrets referenced by name
+(`vaultTokenSecretName` / `vaultClientCertSecretName`), which you create
+separately — the chart never renders them.
+
 ### Vault configuration keys
 
 | Key | Required | Default | Description |
