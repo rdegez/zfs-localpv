@@ -1,0 +1,94 @@
+# Example: per-PV ZFS native encryption with keys managed by HashiCorp Vault.
+#
+# How it works:
+#   * A ConfigMap (openebs-zfs-kms-config) in the driver namespace describes the
+#     Vault backend, keyed by a KMS id ("vault-prod" here).
+#   * The StorageClass turns on encryption and selects that KMS id via
+#     encryptionKMSID.
+#   * At CreateVolume the controller generates a 32-byte hex key and stores it in
+#     Vault KV v2 under <backend>/<keyPrefix>/<volume-id>. The node agent fetches
+#     it (over stdin) to create the dataset and to `zfs load-key` at mount.
+#     The key never touches the ZFSVolume CR, etcd, or the node disk.
+#   * At DeleteVolume the controller removes the key from Vault (best effort).
+#
+# Requirements:
+#   * The Vault KV v2 engine is mounted at "secret/" (adjust vaultBackendPath).
+#   * The controller and node DaemonSet can read this ConfigMap and (for token
+#     auth) the token Secret (RBAC added by the chart).
+#
+# NOTE: set the namespace of the ConfigMap and token Secret to the namespace the
+# zfs-localpv driver runs in (OPENEBS_NAMESPACE, e.g. "openebs" or "kube-system").
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: openebs-zfs-kms-config
+  namespace: openebs
+data:
+  # Each key is a KMS id; the value is a JSON object describing one backend.
+  vault-prod: |
+    {
+      "provider": "vault",
+      "vaultAddress": "https://vault.example.com:8200",
+      "vaultBackendPath": "secret",
+      "vaultKeyPrefix": "zfs-localpv",
+      "vaultAuthMethod": "token",
+      "vaultTokenSecretName": "openebs-zfs-vault-token",
+      "vaultSkipVerify": "false"
+    }
+  # Kubernetes-auth variant (no long-lived token):
+  #   "vaultAuthMethod": "kubernetes", "vaultRole": "zfs-localpv",
+  #   "vaultAuthPath": "kubernetes"
+  #
+  # Client-certificate (mTLS) variant, e.g. OVHcloud OKMS Secret Manager. The
+  # OKMS REST endpoint is https://<region>.okms.ovh.net/api/<OKMS_ID> and it
+  # authenticates callers by a client certificate (created under "Certificats
+  # d'acces"), not a token. Download the REST API CA from the OKMS console.
+  #   vault-okms: |
+  #     {
+  #       "provider": "vault",
+  #       "vaultAddress": "https://eu-west-rbx.okms.ovh.net/api/<OKMS_ID>",
+  #       "vaultBackendPath": "secret",
+  #       "vaultKeyPrefix": "zfs-localpv",
+  #       "vaultAuthMethod": "mtls",
+  #       "vaultClientCertSecretName": "openebs-zfs-okms-cert",
+  #       "vaultCACert": "-----BEGIN CERTIFICATE-----\n...OKMS REST CA...\n-----END CERTIFICATE-----"
+  #     }
+  # with a kubernetes.io/tls Secret (driver namespace) holding the access cert:
+  #   kubectl -n <driver-ns> create secret tls openebs-zfs-okms-cert \
+  #     --cert=okms-access.crt --key=okms-access.key
+---
+# Token used by "token" auth. For "kubernetes" auth this Secret is not needed.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: openebs-zfs-vault-token
+  namespace: openebs
+type: Opaque
+stringData:
+  token: "s.xxxxxxxxxxxxxxxxxxxxxxxx"
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: openebs-zfspv-encrypted-vault
+allowVolumeExpansion: true
+parameters:
+  poolname: "zfspv-pool"
+  fstype: "ext4"
+  encryption: "aes-256-gcm"
+  encryptionKMSID: "vault-prod"
+provisioner: zfs.csi.openebs.io
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: csi-zfspv-encrypted-vault
+  namespace: default
+spec:
+  storageClassName: openebs-zfspv-encrypted-vault
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 4Gi

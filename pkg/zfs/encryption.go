@@ -27,6 +27,7 @@ import (
 
 	k8sapi "github.com/openebs/lib-csi/pkg/client/k8s"
 	apis "github.com/openebs/zfs-localpv/v2/pkg/apis/openebs.io/zfs/v1"
+	"github.com/openebs/zfs-localpv/v2/pkg/kms"
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -59,7 +60,7 @@ var (
 )
 
 // getKubeClient lazily builds and caches a Kubernetes clientset, used to read
-// the Secret that holds a volume's encryption key. Both the node
+// the Secrets/ConfigMaps that back the encryption key stores. Both the node
 // agent (at create time) and the node plugin (at mount time) rely on it. Only a
 // successful client is cached; a transient failure is returned and retried on
 // the next call, so one early error does not disable encryption for the
@@ -74,6 +75,13 @@ func getKubeClient() (kubernetes.Interface, error) {
 	if err != nil {
 		return nil, fmt.Errorf("zfs: failed to build kubeconfig: %w", err)
 	}
+	// This shared client backs a volume's key material: reading the Secret / KMS
+	// ConfigMap on every provision and load-key, and also creating/updating the
+	// driver-managed auto Secret (Mode 3). The client-go defaults (QPS 5, Burst
+	// 10) throttle hard when many encrypted volumes are provisioned or remounted
+	// at once (e.g. after a node reboot), so raise them.
+	cfg.QPS = 100
+	cfg.Burst = 200
 	c, err := kubernetes.NewForConfig(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("zfs: failed to build kube client: %w", err)
@@ -109,7 +117,7 @@ func provisionAutoKeySecret(client kubernetes.Interface, namespace, volName stri
 		return "", "", fmt.Errorf("zfs: get auto key secret %s/%s: %w", namespace, name, err)
 	}
 
-	key, err := generateHexKey()
+	key, err := kms.GenerateHexKey()
 	if err != nil {
 		return "", "", err
 	}
@@ -130,7 +138,7 @@ func provisionAutoKeySecret(client kubernetes.Interface, namespace, volName stri
 		},
 		Immutable: &immutable,
 		Type:      corev1.SecretTypeOpaque,
-		Data:      map[string][]byte{encryptionSecretKeyField: []byte(key)},
+		Data:      map[string][]byte{kms.SecretKeyField: []byte(key)},
 	}
 	if _, err := client.CoreV1().Secrets(namespace).Create(
 		context.Background(), secret, metav1.CreateOptions{}); err != nil {
@@ -222,28 +230,131 @@ func GetPVC(namespace, name string) (*corev1.PersistentVolumeClaim, error) {
 }
 
 // UsesManagedKey reports whether the volume's encryption key is managed by the
-// driver (sourced from a referenced Secret), as opposed to the legacy
+// driver (sourced from a referenced Secret or a KMS), as opposed to the legacy
 // keylocation-file mode.
 func UsesManagedKey(vol *apis.ZFSVolume) bool {
-	return vol.Spec.EncryptionKeyRef != nil
+	return vol.Spec.EncryptionKeyRef != nil || vol.Spec.EncryptionKMSID != ""
+}
+
+// kmsConfigMapName returns the name of the ConfigMap holding KMS backend
+// configuration sections (overridable via the ZFS_KMS_CONFIGMAP_NAME env var).
+func kmsConfigMapName() string {
+	if name := os.Getenv("ZFS_KMS_CONFIGMAP_NAME"); name != "" {
+		return name
+	}
+	return kms.DefaultKMSConfigMapName
+}
+
+// keyStore builds the KeyStore for the given key source. A non-empty secretName
+// selects the user provided Secret backend; otherwise a non-empty kmsID selects
+// a backend from the KMS ConfigMap (e.g. Vault).
+func keyStore(kmsID, secretName, secretNamespace string) (kms.KeyStore, error) {
+	client, err := getKubeClient()
+	if err != nil {
+		return nil, err
+	}
+
+	switch {
+	case secretName != "":
+		return kms.GetKMS(kms.ProviderK8sSecret, kms.ProviderInitArgs{
+			Config: map[string]interface{}{
+				kms.ConfigSecretName:      secretName,
+				kms.ConfigSecretNamespace: secretNamespace,
+			},
+			Namespace:  secretNamespace,
+			KubeClient: client,
+		})
+	case kmsID != "":
+		provider, cfg, cerr := kms.LoadProviderConfig(client, OpenEBSNamespace, kmsConfigMapName(), kmsID)
+		if cerr != nil {
+			return nil, cerr
+		}
+		return kms.GetKMS(provider, kms.ProviderInitArgs{
+			KMSID:      kmsID,
+			Config:     cfg,
+			Namespace:  OpenEBSNamespace,
+			KubeClient: client,
+		})
+	default:
+		return nil, fmt.Errorf("zfs: no managed encryption key source")
+	}
+}
+
+// resolveKeyStore builds the KeyStore for the volume from its spec.
+func resolveKeyStore(vol *apis.ZFSVolume) (kms.KeyStore, error) {
+	var secretName, secretNamespace string
+	if ref := vol.Spec.EncryptionKeyRef; ref != nil {
+		secretName, secretNamespace = ref.Name, ref.Namespace
+	}
+	return keyStore(vol.Spec.EncryptionKMSID, secretName, secretNamespace)
 }
 
 // ValidateEncryptionSecret checks, at provisioning time, that the referenced
 // Secret exists and holds a valid hex key, so a misconfigured annotation fails
 // fast on the controller with a clear message instead of later on the node.
 func ValidateEncryptionSecret(name, namespace string) error {
-	_, err := fetchKeyFromSecret(namespace, name)
+	ks, err := keyStore("", name, namespace)
+	if err != nil {
+		return err
+	}
+	defer ks.Destroy()
+	_, err = ks.FetchKey(context.Background(), "")
 	return err
 }
 
-// FetchEncryptionKey returns the hex encoded encryption key for the volume,
-// read from the referenced Kubernetes Secret.
+// FetchEncryptionKey returns the hex encoded encryption key for the volume.
 func FetchEncryptionKey(vol *apis.ZFSVolume) (string, error) {
-	ref := vol.Spec.EncryptionKeyRef
-	if ref == nil {
-		return "", fmt.Errorf("zfs: no encryption key secret referenced")
+	ks, err := resolveKeyStore(vol)
+	if err != nil {
+		return "", err
 	}
-	return fetchKeyFromSecret(ref.Namespace, ref.Name)
+	defer ks.Destroy()
+	return ks.FetchKey(context.Background(), vol.Name)
+}
+
+// ProvisionEncryptionKey ensures a key exists for volName in the KMS identified
+// by kmsID, generating and storing a fresh one if needed. It is called on the
+// controller at CreateVolume so the key is present before the node agent
+// creates the encrypted dataset.
+func ProvisionEncryptionKey(kmsID, volName string) error {
+	ks, err := keyStore(kmsID, "", "")
+	if err != nil {
+		return err
+	}
+	defer ks.Destroy()
+	_, err = ks.GetOrCreateKey(context.Background(), volName)
+	return err
+}
+
+// RemoveEncryptionKey deletes the volume's key from its KMS. It is a no-op for
+// user-owned Secrets and for volumes without a managed key.
+func RemoveEncryptionKey(vol *apis.ZFSVolume) error {
+	if !UsesManagedKey(vol) {
+		return nil
+	}
+	ks, err := resolveKeyStore(vol)
+	if err != nil {
+		return err
+	}
+	defer ks.Destroy()
+	return ks.RemoveKey(context.Background(), vol.Name)
+}
+
+// CleanupEncryptionKey best-effort removes the KMS-stored key (e.g. Vault) of a
+// volume that is being destroyed. It is a no-op for Secret-backed keys: user
+// Secrets are never touched, and the driver-managed auto Secret is
+// garbage-collected through its OwnerReference to the ZFSVolume. It is called
+// from DeleteVolumeAndKey once the CR is deleted, on every real deletion path
+// (immediate delete and delete after the last snapshot), but not on a create
+// rollback, which keeps the key so the retried CreateVolume reuses it. Failures
+// are logged, not fatal: zfs destroy does not need the key loaded.
+func CleanupEncryptionKey(vol *apis.ZFSVolume) {
+	if vol == nil {
+		return
+	}
+	if err := RemoveEncryptionKey(vol); err != nil {
+		klog.Warningf("zfs: failed to remove encryption key for %s: %s", vol.Name, err.Error())
+	}
 }
 
 // getDatasetProperty returns a single ZFS property value for an arbitrary
@@ -260,7 +371,7 @@ func getDatasetProperty(dataset, prop string) (string, error) {
 
 // loadKeyForDataset loads the encryption key (fetched from vol's key source)
 // onto the encryption root of the given dataset, unless it is already loaded or
-// the dataset is not encrypted. vol supplies the key source (a Secret); the
+// the dataset is not encrypted. vol supplies the key source (Secret/KMS); the
 // dataset may be vol's own dataset or, for clones, the parent it inherits from.
 func loadKeyForDataset(vol *apis.ZFSVolume, dataset string) error {
 	keystatus, err := getDatasetProperty(dataset, "keystatus")
@@ -304,12 +415,12 @@ func loadKeyForDataset(vol *apis.ZFSVolume, dataset string) error {
 			klog.Infof("zfs: encryption key already loaded for %s", root)
 			return nil
 		}
-		// A valid-hex but WRONG key (e.g. the referenced Secret value was
+		// A valid-hex but WRONG key (e.g. the referenced Secret/KMS value was
 		// changed after the volume was created) is rejected by zfs. Surface a
 		// clear, actionable error rather than a bare zfs failure.
 		if strings.Contains(string(out), "Incorrect key") {
 			klog.Errorf("zfs: incorrect encryption key for %v: %s", root, strings.TrimSpace(string(out)))
-			return fmt.Errorf("zfs: encryption key for %s is incorrect — the referenced Secret does not match the dataset and may have been changed; the volume cannot be unlocked with it", root)
+			return fmt.Errorf("zfs: encryption key for %s is incorrect — the referenced key (Secret/KMS) does not match the dataset and may have been changed; the volume cannot be unlocked with it", root)
 		}
 		zerr := NewZFSError("zfs load-key", root, err, out)
 		klog.Errorf("zfs: could not load key for %v error: %s", root, zerr)
