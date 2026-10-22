@@ -21,6 +21,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
+	zfsapi "github.com/openebs/zfs-localpv/v2/pkg/apis/openebs.io/zfs/v1"
 	"github.com/openebs/zfs-localpv/v2/pkg/zfs"
 )
 
@@ -68,6 +69,33 @@ func TestPVCEncryptionSecretName(t *testing.T) {
 			}
 			assert.NoError(t, err)
 			assert.Equal(t, test.want, got)
+		})
+	}
+}
+
+func TestCloneKeyConflict(t *testing.T) {
+	key := zfs.PVCEncryptionSecretAnnotation
+	src := &zfsapi.EncryptionKeyReference{Name: "abc", Namespace: "apps"}
+	tests := map[string]struct {
+		src         *zfsapi.EncryptionKeyReference
+		annotations map[string]string
+		wantErr     bool
+	}{
+		"no annotation":                                        {src: src},
+		"annotation naming the source's key":                   {src: src, annotations: map[string]string{key: "abc"}},
+		"annotation naming another key":                        {src: src, annotations: map[string]string{key: "def"}, wantErr: true},
+		"empty annotation":                                     {src: src, annotations: map[string]string{key: ""}, wantErr: true},
+		"annotation on a clone of a non-per-volume-key source": {annotations: map[string]string{key: "abc"}, wantErr: true},
+		"no annotation, source without per-volume key":         {},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			err := cloneKeyConflict(test.src, test.annotations, "apps")
+			if test.wantErr {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
 		})
 	}
 }
