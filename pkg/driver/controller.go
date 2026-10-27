@@ -222,6 +222,19 @@ func waitForReadySnapshot(ctx context.Context, snapname string) error {
 	}
 }
 
+// pvcEncryptionSecretName returns the Secret named by the secret-name annotation,
+// or "" if unset. An empty annotation is an error.
+func pvcEncryptionSecretName(annotations map[string]string) (string, error) {
+	name, ok := annotations[zfs.PVCEncryptionSecretAnnotation]
+	if !ok {
+		return "", nil
+	}
+	if strings.TrimSpace(name) == "" {
+		return "", fmt.Errorf("the %q annotation is set but empty", zfs.PVCEncryptionSecretAnnotation)
+	}
+	return name, nil
+}
+
 // CreateZFSVolume create new zfs volume from csi volume request
 func CreateZFSVolume(ctx context.Context, req *csi.CreateVolumeRequest) (*zfsapi.ZFSVolume, error) {
 	volName := strings.ToLower(req.GetName())
@@ -254,6 +267,66 @@ func CreateZFSVolume(ctx context.Context, req *csi.CreateVolumeRequest) (*zfsapi
 	fstype := parameters["fstype"]
 	shared := parameters["shared"]
 	quotatype := parameters["quotatype"]
+
+	// Per-volume key source: the Secret named by the PVC annotation. It requires
+	// `encryption`: fail closed.
+	var encKeySecretName, encKeySecretNamespace string
+	{
+		encryptionRequested := len(encr) != 0
+
+		pvcName := parameters["csi.storage.k8s.io/pvc/name"]
+		pvcNamespace := parameters["csi.storage.k8s.io/pvc/namespace"]
+		var pvcSecretName string
+		if pvcName != "" && pvcNamespace != "" {
+			pvc, perr := zfs.GetPVC(pvcNamespace, pvcName)
+			if perr != nil {
+				// the PVC may name its own key: never guess
+				return nil, status.Errorf(codes.Internal,
+					"failed to get pvc %s/%s: %s", pvcNamespace, pvcName, perr.Error())
+			}
+			name, aerr := pvcEncryptionSecretName(pvc.Annotations)
+			if aerr != nil {
+				return nil, status.Errorf(codes.InvalidArgument, "pvc %s/%s: %s",
+					pvcNamespace, pvcName, aerr.Error())
+			}
+			pvcSecretName = name
+		}
+
+		// fail closed: never create a plaintext volume when a key source is requested
+		if !encryptionRequested && pvcSecretName != "" {
+			return nil, status.Errorf(codes.InvalidArgument,
+				"an encryption key source was requested (secret-name annotation) "+
+					"but the StorageClass does not set the 'encryption' parameter; "+
+					"refusing to create an unencrypted volume")
+		}
+
+		if encryptionRequested {
+			if pvcSecretName != "" {
+				// fail fast on a missing or malformed key
+				if err := zfs.ValidateEncryptionSecret(pvcSecretName, pvcNamespace); err != nil {
+					return nil, status.Errorf(codes.InvalidArgument,
+						"encryption key secret referenced by pvc %s/%s is invalid: %s",
+						pvcNamespace, pvcName, err.Error())
+				}
+				encKeySecretName = pvcSecretName
+				encKeySecretNamespace = pvcNamespace
+				kf = "hex" // managed keys are supplied to ZFS as raw hex (32 bytes)
+			}
+
+			// encryption without any key source: fail here, not in zfs create
+			if encKeySecretName == "" && kl == "" {
+				return nil, status.Errorf(codes.InvalidArgument,
+					"encryption is requested but no key source resolved: set the %q PVC "+
+						"annotation, or a legacy keylocation+keyformat on the StorageClass",
+					zfs.PVCEncryptionSecretAnnotation)
+			}
+		}
+	}
+
+	// managed keys use keylocation=prompt: no legacy keylocation on the CR
+	if encKeySecretName != "" {
+		kl = ""
+	}
 
 	vtype := zfs.GetVolumeType(fstype)
 
@@ -362,6 +435,7 @@ func CreateZFSVolume(ctx context.Context, req *csi.CreateVolumeRequest) (*zfsapi
 		WithEncryption(encr).
 		WithKeyFormat(kf).
 		WithKeyLocation(kl).
+		WithEncryptionKeySecret(encKeySecretName, encKeySecretNamespace).
 		WithThinProv(tp).
 		WithVolumeType(vtype).
 		WithVolumeStatus(zfs.ZFSStatusPending).
@@ -627,6 +701,11 @@ func (cs *controller) CreateVolume(
 	// the node agent formats the volume, hand it the options of the storage class
 	if formatOptions := helpers.GetInsensitiveParameter(&parameters, "formatoptions"); formatOptions != "" {
 		cntx[zfs.FormatOptionsKey] = formatOptions
+	}
+
+	// surface encryption on the PV, never the key
+	if marker := zfs.EncryptedMarker(vol); marker != "" {
+		cntx[zfs.OpenEBSEncryptedKey] = marker
 	}
 
 	return csipayload.NewCreateVolumeResponseBuilder().

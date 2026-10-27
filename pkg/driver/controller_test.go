@@ -20,6 +20,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+
+	"github.com/openebs/zfs-localpv/v2/pkg/zfs"
 )
 
 func TestRoundOff(t *testing.T) {
@@ -40,6 +42,32 @@ func TestRoundOff(t *testing.T) {
 	for name, test := range tests {
 		t.Run(name, func(t *testing.T) {
 			assert.Equal(t, test.expected, getRoundedCapacity(test.input))
+		})
+	}
+}
+
+func TestPVCEncryptionSecretName(t *testing.T) {
+	key := zfs.PVCEncryptionSecretAnnotation
+	tests := map[string]struct {
+		annotations map[string]string
+		want        string
+		wantErr     bool
+	}{
+		"no annotations":                {annotations: nil},
+		"annotation not set":            {annotations: map[string]string{"other": "x"}},
+		"annotation set":                {annotations: map[string]string{key: "db-key"}, want: "db-key"},
+		"annotation set but empty":      {annotations: map[string]string{key: ""}, wantErr: true},
+		"annotation set to whitespaces": {annotations: map[string]string{key: "  "}, wantErr: true},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			got, err := pvcEncryptionSecretName(test.annotations)
+			if test.wantErr {
+				assert.Error(t, err)
+				return
+			}
+			assert.NoError(t, err)
+			assert.Equal(t, test.want, got)
 		})
 	}
 }
