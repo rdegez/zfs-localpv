@@ -7,8 +7,9 @@ per PersistentVolume. Two families are available:
   StorageClass, via a `keylocation` file present on every node. See the
   `encryption`, `keyformat`, `keylocation` parameters in
   [storageclasses.md](./storageclasses.md).
-- **Per-volume key** — each PV gets its own key, sourced from a Kubernetes
-  Secret referenced by the PVC.
+- **Per-volume key** — each PV gets its own key, sourced either from a Kubernetes
+  Secret referenced by the PVC (bring your own key), or generated automatically
+  by the driver and stored in a managed Secret.
 
 With per-volume keys, the key material (a 32-byte key encoded as 64 hex
 characters) is **never stored in the ZFSVolume CR or on the node disk**, and is
@@ -25,7 +26,7 @@ encrypted without inspecting the `ZFSVolume` CR:
 
 | Value | Meaning |
 |---|---|
-| `volume` | per-volume key (Secret referenced by the PVC) |
+| `volume` | per-volume key (Secret referenced by the PVC, or generated) |
 | `storageclass` | StorageClass-level key (`keylocation`), shared by every volume of the class |
 | *(absent)* | not encrypted by the driver; the volume may still be encrypted by its pool or parent dataset |
 
@@ -39,7 +40,8 @@ The authoritative source remains the `ZFSVolume` CR (`spec.encryption`,
   the shipped manifests) so the controller learns the PVC name/namespace.
 - RBAC (already included in the Helm chart / operator YAML): the controller and
   node components can `get` Secrets cluster-wide (the referenced Secret can live
-  in any PVC namespace).
+  in any PVC namespace); for the auto mode, the node agent can also
+  `create`/`delete` Secrets, granted **namespaced** to the driver namespace only.
 
 ---
 
@@ -103,6 +105,107 @@ Full example: [`deploy/sample/encrypted-pvc.yaml`](../deploy/sample/encrypted-pv
 
 ---
 
+## Auto-generated key (driver-managed)
+
+For zero-configuration per-volume encryption, the driver can generate the key
+itself and store it in a Secret it manages, in the OpenEBS namespace. This is the
+recommended mode for operators and StatefulSets that create PVCs on their own
+(via `volumeClaimTemplates`): each PVC gets its own unique key with **nothing to
+configure per PVC**.
+
+Opt in on the StorageClass with `autoCreateEncryptionKey: "true"`:
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: openebs-zfspv-encrypted-auto
+parameters:
+  poolname: "zfspv-pool"
+  fstype: "ext4"
+  encryption: "aes-256-gcm"
+  autoCreateEncryptionKey: "true"
+provisioner: zfs.csi.openebs.io
+```
+
+A StatefulSet then just references the StorageClass — every replica's PVC gets
+its own key:
+
+```yaml
+  volumeClaimTemplates:
+    - metadata: { name: data }
+      spec:
+        storageClassName: openebs-zfspv-encrypted-auto
+        accessModes: ["ReadWriteOnce"]
+        resources: { requests: { storage: 10Gi } }
+```
+
+Behaviour — the key lives exactly as long as the data:
+- The node agent generates a 32-byte hex key right before `zfs create` and stores
+  it in an immutable Secret named `zfs-enc-<volume-id>` in the OpenEBS namespace,
+  labelled `encryption.openebs.io/auto-managed=true`. The Secret holds the key
+  under `key`, as in the Secret mode, and the volume name under `volume` (used to
+  back the key up, see below). The generation is idempotent across retries, and a
+  pre-existing Secret of that name without the label is never adopted.
+- The node agent deletes the Secret only after `zfs destroy` succeeded. A
+  provisioning that fails before the dataset exists leaves no Secret behind.
+- Deleting a ZFSVolume **without** destroying its dataset (removing its
+  `zfs.openebs.io/finalizer` first, see
+  [import-existing-volume.md](./import-existing-volume.md)) keeps the key, so the
+  dataset can be imported again later.
+- A clone shares its parent's Secret: it never creates nor deletes it.
+
+**Security trade-off:** the key is stored at rest in a Kubernetes Secret (typically in etcd, base64-encoded). Enable
+[etcd encryption at rest](https://kubernetes.io/docs/tasks/administer-cluster/encrypt-data/)
+if this matters for your threat model.
+
+### Using both modes on one StorageClass
+
+The two per-volume modes are evaluated in precedence order, so a **single
+StorageClass can serve both "bring your own key" and "auto" users**: the PVC
+annotation (Secret mode) takes precedence, else `autoCreateEncryptionKey: "true"`
+auto-generates a key. A developer who sets the annotation overrides the auto
+behaviour for their PVC. If the annotation is empty or references a missing or
+invalid Secret, or if the PVC cannot be read, provisioning fails (it does
+**not** silently fall back to auto-generation).
+
+### Protecting the generated keys
+
+The managed Secret is the only copy of the generated key (unless you back it up
+to a KMS, see below), so it is protected two ways:
+
+- **`immutable: true`** blocks an accidental `kubectl edit`/patch that would
+  silently corrupt the key and make the volume unmountable.
+- A **ValidatingAdmissionPolicy** shipped with the Helm chart (Kubernetes >= 1.30,
+  `encryptionKeyProtection.enabled`, on by default) denies the deletion of these
+  Secrets to everyone, cluster-admin included, except the node agent's service
+  account, and denies removing their `encryption.openebs.io/auto-managed` label,
+  which would bypass the policy. Deleting the driver namespace therefore fails to
+  remove them as long as the policy is in place. The policy guards against
+  mistakes; it is not a security boundary against cluster administrators, who
+  can lift it.
+
+To delete such a Secret anyway (break-glass, for instance after destroying a
+dataset by hand), annotate it first:
+
+```bash
+kubectl -n openebs annotate secret zfs-enc-<volume-id> encryption.openebs.io/allow-key-deletion=true
+kubectl -n openebs delete secret zfs-enc-<volume-id>
+```
+
+The policy and its binding carry `helm.sh/resource-policy: keep`, so
+`helm uninstall` leaves them in place and the keys stay protected even without
+the driver. Delete them by hand once no volume uses a generated key anymore.
+
+The policy is not part of the operator YAML (`deploy/zfs-operator.yaml`); when
+installing with it, apply the two objects rendered by the chart template
+`encryption-key-protection.yaml`, adjusting the namespace and the node service
+account name.
+
+Full example: [`deploy/sample/encrypted-pvc-auto.yaml`](../deploy/sample/encrypted-pvc-auto.yaml).
+
+---
+
 ## Keeping keys in an external KMS (External Secrets Operator)
 
 The driver only reads keys from Kubernetes Secrets. To keep the source of truth,
@@ -134,6 +237,62 @@ spec:
 With `creationPolicy: Owner`, deleting the `ExternalSecret` deletes the Secret;
 the key itself stays in the KMS.
 
+**Push — back up the generated keys to the KMS (auto mode, key escrow).** A
+single `PushSecret` in the driver namespace selects the driver-managed Secrets by
+label and copies each key to its own KMS entry, named after its volume
+(`zfs-localpv/<volume-id>` below). ESO applies the same remote reference to every
+Secret a label selector matches, so the template builds a per-volume entry from
+the `volume` and `key` data of each Secret, and `dataTo` pushes it; the Secrets
+themselves are not modified. With `deletionPolicy: None`, the copy stays in the
+KMS after the volume, and thus its Secret, is deleted. Example for a Vault KV v2
+store:
+
+> **Warning:** do not use `deletionPolicy: Delete` with a label selector. As of
+> ESO 2.12, each reconcile deletes the KMS entries pushed for the other Secrets
+> the selector matches, so only one key is kept in the KMS at a time
+> ([external-secrets#7123](https://github.com/external-secrets/external-secrets/issues/7123)).
+
+```yaml
+apiVersion: external-secrets.io/v1alpha1
+kind: PushSecret
+metadata:
+  name: zfs-encryption-keys
+  namespace: openebs
+spec:
+  refreshInterval: 1m
+  deletionPolicy: None
+  secretStoreRefs:
+    - { kind: ClusterSecretStore, name: vault }
+  selector:
+    secret:
+      selector:
+        matchLabels:
+          encryption.openebs.io/auto-managed: "true"
+  template:
+    templateFrom:
+      - target: Data
+        literal: |
+          backup-{{ .volume }}: '{"key":"{{ .key }}"}'
+  dataTo:
+    - storeRef: { kind: ClusterSecretStore, name: vault }
+      match: { regexp: "^backup-" }
+      rewrite:
+        - regexp: { source: "^backup-(.*)$", target: "zfs-localpv/$1" }
+```
+
+With a Vault store, each KMS entry then holds `{"key": "<64 hex>"}`. The layout
+depends on the ESO provider: the OVHcloud provider, for instance, nests the
+value under the generated entry name, `{"backup-<volume-id>": {"key": "<64 hex>"}}`
+(property `backup-<volume-id>.key`). If a driver-managed Secret is lost while
+its dataset still exists, recreate it from that copy with the same name, labels
+and data (`key`, `volume`) before the volume is mounted again.
+
+Nothing in the driver checks that ESO actually pushed a key, and a `PushSecret`
+status can report entries as synced when they are not
+([external-secrets#7123](https://github.com/external-secrets/external-secrets/issues/7123)).
+Monitor the backup on the KMS side too, for example with a periodic check that
+every driver-managed Secret has its entry in the KMS.
+
 To keep the key material out of etcd, enable
 [etcd encryption at rest with a KMS provider](https://kubernetes.io/docs/tasks/administer-cluster/kms-provider/).
 
@@ -157,7 +316,8 @@ printf '%s' "$NEWKEY" | zfs change-key -o keyformat=hex -o keylocation=prompt <p
 
 `zfs change-key` re-wraps the dataset master key; existing data is not
 re-encrypted. Update the Secret **before** running `change-key` so a crash
-between the two steps leaves a recoverable state.
+between the two steps leaves a recoverable state. The driver-managed Secrets of
+the auto mode are immutable and are not meant to be rotated.
 
 ---
 
@@ -173,6 +333,10 @@ between the two steps leaves a recoverable state.
   field from the `ZFSVolume` objects, so the driver no longer knows where the key
   is and those volumes cannot be unlocked at mount. Move their data to other
   volumes before downgrading.
+- The auto mode adds a Role for the node agent and the ValidatingAdmissionPolicy
+  to the chart. With the operator YAML, apply the policy by hand (see
+  *Protecting the generated keys*). Generated keys live in the driver namespace:
+  keep the same namespace across upgrades while volumes use them.
 
 ---
 
@@ -187,7 +351,11 @@ between the two steps leaves a recoverable state.
   on stdin, so it never appears in process arguments or logs.
 - The node is granted cluster-wide `get` (not `list`) on Secrets, because a
   referenced Secret can live in any PVC namespace. The controller already has
-  `get`/`list` on Secrets (the CSI sidecars need it) and only reads them.
+  `get`/`list` on Secrets (the CSI sidecars need it) and only reads them. The
+  auto mode's `create`/`delete` on Secrets is granted to the node agent only,
+  **namespaced** to the driver namespace (`openebs-zfs-node-secrets-role`). The
+  node never deletes a Secret without the `encryption.openebs.io/auto-managed=true`
+  label.
 
 ## Limitations
 
@@ -195,6 +363,10 @@ between the two steps leaves a recoverable state.
   The legacy StorageClass `keyformat` (`passphrase`/`raw`/`hex`) is unaffected.
 - Key rotation is manual (see above) — the driver performs no automatic rotation
   for either the per-volume or the legacy StorageClass encryption.
+- Generated keys live in the driver namespace, and each volume references its
+  key there. Do not delete that namespace, or reinstall the driver in another
+  one, while volumes use generated keys: back the keys up first (see *Keeping
+  keys in an external KMS*).
 
 The legacy `keylocation`-file StorageClass encryption continues to work unchanged
 alongside per-volume keys.
